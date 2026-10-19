@@ -57,6 +57,10 @@ public:
   // streamed: the five int8 matrices per block and the QKFIX fp16 weights stay on disk.
   static Status load(metal::MetalBackend &backend, const std::string &dir, const std::set<int> &qkfixBlocks,
                      bool streamed, std::unique_ptr<DitWeights> &out);
+  // Deterministic synthetic weights (model/Synthetic.hpp) with the converted shapes, resident, no files: the listed
+  // blocks (empty: all 50), the QKFIX blocks among them and the io weights.
+  static Status synthetic(metal::MetalBackend &backend, const std::set<int> &qkfixBlocks, const std::set<int> &blocks,
+                          std::unique_ptr<DitWeights> &out);
 
   [[nodiscard]] const DitBlockWeights &block(int b) const { return blocks_[b]; }
   [[nodiscard]] const QkFixWeights &qkfix(int b) const { return qkfix_.at(b); }

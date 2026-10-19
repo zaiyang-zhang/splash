@@ -274,7 +274,7 @@ Status Scheduler::forward(const uint16_t *adaBlocks, const uint16_t *adaFinal, c
   if (stream_) stream_->resetStats();
   std::vector<Committed> cbs;
   cbs.reserve(H3_DIT_BLOCKS * 32);
-  for (int block = 0; block < H3_DIT_BLOCKS; ++block) {
+  for (int block = 0; block < blocks_; ++block) {
     BlockBinding binding = residentBinding(block);
     std::shared_ptr<std::atomic<int>> pending;
     dispatch_semaphore_t release0 = nullptr, release1 = nullptr;

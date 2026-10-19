@@ -56,6 +56,8 @@ public:
                  float *videoOut, float *audioOut, ForwardStats &stats);
 
   [[nodiscard]] const MemoryPlan &plan() const { return plan_; }
+  // Blocks per forward (default all 50; the quick synthetic check runs 1).
+  void setBlocks(int blocks) { blocks_ = blocks; }
 
 private:
   [[nodiscard]] ops::AttentionBuffers attentionBuffers() const;
@@ -70,6 +72,7 @@ private:
   WeightStream *stream_;
   std::set<int> qkfixBlocks_;
   ops::LinearBranch branch_;
+  int blocks_ = H3_DIT_BLOCKS;
 };
 
 } // namespace h3

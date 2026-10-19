@@ -2,6 +2,7 @@
 #include "video/abi/h3.h"
 
 #include "video/engine/Engine.hpp"
+#include "video/media/Mp4Writer.hpp"
 
 #include <cstring>
 #include <memory>
@@ -10,6 +11,8 @@
 struct h3_engine {
   std::unique_ptr<h3::Engine> engine;
   std::string error;
+  std::unique_ptr<h3::model::Prepared> prepared;  // h3_prep outputs
+  uint64_t seed = 0;
 };
 
 namespace {
@@ -78,8 +81,10 @@ h3_status h3_geometry_of(const h3_request *request, h3_geometry *out) {
   h3::Status s = h3::model::VideoGeometry::of(request->frames, request->width, request->height, g);
   if (s.ok()) s = h3::model::planVaeDecode(g, plan);
   if (!s.ok()) return report(nullptr, s);
-  *out = h3_geometry{g.frames,     g.width,     g.height,     g.latentFrames,       g.latentHeight,
-                     g.latentWidth, g.videoRows(), g.audioRows, plan.outputFrames(), h3::model::previewFrames(g.latentFrames)};
+  *out = h3_geometry{g.frames,       g.width,       g.height,           g.latentFrames,
+                     g.latentHeight, g.latentWidth, g.videoRows(),      g.audioRows,
+                     plan.outputFrames(), h3::model::previewFrames(g.latentFrames),
+                     static_cast<int32_t>(h3::ops::AudioDecoder::samples(g.audioRows / 2))};
   return H3_OK;
 }
 
@@ -106,6 +111,32 @@ h3_status h3_create(const h3_config *config, const h3_request *request, h3_engin
 void h3_destroy(h3_engine *engine) { delete engine; }
 
 const char *h3_error(const h3_engine *engine) { return engine ? engine->error.c_str() : ""; }
+
+h3_status h3_prep(h3_engine *e, const h3_prep_inputs *in, h3_prepared *out) {
+  if (!e || !in || !out) return H3_ERROR_ARGUMENT;
+  auto p = std::make_unique<h3::model::Prepared>();
+  const h3_status r = report(e, e->engine->prep({in->hidden, in->text_rows, in->steps, in->seed}, *p));
+  if (r != H3_OK) return r;
+  e->prepared = std::move(p);
+  e->seed = in->seed;
+  const h3::model::Prepared &q = *e->prepared;
+  *out = h3_prepared{q.textRows,        q.rows,           q.steps,          static_cast<int32_t>(q.table.size()),
+                     q.tags.data(),     q.rope.data(),    q.pos.data(),     q.text.data(),
+                     q.adaBlocks.data(), q.adaFinal.data(), q.vT.data(),      q.aT.data(),
+                     q.vSigmas.data(),  q.aSigmas.data(), q.table.data(),   q.tv.data(),
+                     q.ta.data(),       q.videoNoise.data(), q.audioNoise.data(), q.totalS};
+  return H3_OK;
+}
+
+h3_status h3_prep_write(h3_engine *e, const char *dir) {
+  if (!e || !dir) return H3_ERROR_ARGUMENT;
+  if (!e->prepared) return report(e, h3::error(h3::Code::State, "h3_prep_write before h3_prep"));
+  return report(e, h3::model::Prep::write(dir, *e->prepared, e->engine->request().variant, e->seed, "h3_prep"));
+}
+
+void h3_prep_release(h3_engine *e) {
+  if (e) e->prepared.reset();
+}
 
 h3_status h3_dit_load(h3_engine *e, const h3_dit_inputs *in) {
   if (!e || !in) return H3_ERROR_ARGUMENT;
@@ -166,6 +197,24 @@ h3_status h3_preview(h3_engine *e, const float *video_latents, uint8_t *frames, 
   h3::PreviewStats s;
   const h3_status r = report(e, e->engine->preview(video_latents, frames, yuv420, s));
   if (stats) *stats = h3_preview_stats{s.wallS, s.gpuS, s.hostCopyS, s.nonfinite, s.chunks, s.frames, s.deviceMb};
+  return r;
+}
+
+h3_status h3_decode_audio(h3_engine *e, const float *audio_latents, float *wav, h3_audio_stats *stats) {
+  if (!e || !audio_latents || !wav) return H3_ERROR_ARGUMENT;
+  h3::AudioStats s;
+  const h3_status r = report(e, e->engine->decodeAudio(audio_latents, wav, s));
+  if (stats) *stats = h3_audio_stats{s.wallS, s.gpuS, s.samples, s.nonfinite, s.deviceMb};
+  return r;
+}
+
+h3_status h3_write_mp4(const char *path, const uint8_t *frames, int32_t frame_count, int32_t width, int32_t height,
+                       const float *wav, int64_t samples, h3_mp4_stats *stats) {
+  if (!path || !frames) return H3_ERROR_ARGUMENT;
+  h3::media::Mp4Stats s;
+  const h3_status r = report(nullptr, h3::media::writeMp4(path, frames, frame_count, width, height, wav, samples, s));
+  if (stats)
+    *stats = h3_mp4_stats{s.wallS, s.frames, s.audioSamples, s.videoSeconds, s.audioSeconds, s.bytes, s.videoBitrate};
   return r;
 }
 

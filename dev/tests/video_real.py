@@ -68,7 +68,8 @@ def call(port, method, path, body=None, timeout=120):
 
 class MemorySampler:
     """The host's used memory (active + wired + compressed pages) and the
-    footprint of this server's processes, every interval seconds."""
+    resident size of this checkout's engine and video processes, every
+    interval seconds."""
 
     def __init__(self, interval=1.0):
         self.interval = interval
@@ -97,13 +98,14 @@ class MemorySampler:
         processes = {}
         for line in output.splitlines():
             pid, rss, command = line.strip().split(None, 2)
+            words = command.split()
+            # This checkout's engine and video processes, by subcommand.
             if (
-                "build/splash" in command
-                or "-m h3" in command
-                or "video_audio" in command
+                words
+                and words[0].endswith(str(ROOT / "build/splash"))
+                and len(words) > 1
             ):
-                name = command.split()[1] if "build/splash" in command else "frontend"
-                processes[name] = processes.get(name, 0) + int(rss) * 1024
+                processes[words[1]] = processes.get(words[1], 0) + int(rss) * 1024
         return processes
 
     def _run(self):
@@ -166,8 +168,6 @@ class VideoServer(RealServer):
             "--video-root",
             str(arguments.video_root.resolve()),
         ]
-        if arguments.video_frontend:
-            command += ["--video-frontend", str(arguments.video_frontend)]
         self.process = subprocess.Popen(
             command,
             cwd=ROOT,
@@ -202,7 +202,6 @@ def main():
     parser.add_argument("--model", required=True)
     parser.add_argument("--package", type=Path, required=True)
     parser.add_argument("--video-root", type=Path, required=True)
-    parser.add_argument("--video-frontend", type=Path)
     parser.add_argument("--binary", type=Path, default=ROOT / "build/splash")
     parser.add_argument("--golden", type=Path, help="hidden states to inject (npz)")
     parser.add_argument(

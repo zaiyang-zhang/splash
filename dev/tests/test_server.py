@@ -560,7 +560,6 @@ def main_args(**overrides):
             "binary": "splash",
             "kv_format": "int8",
             "video_root": None,
-            "video_frontend": None,
             **overrides,
         }
     )

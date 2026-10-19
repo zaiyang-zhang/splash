@@ -60,6 +60,11 @@ MACOS_MIN_VERSION := 26.4
 MACOS_TARGET_FLAG := -mmacosx-version-min=$(MACOS_MIN_VERSION)
 PROD_METALFLAGS := -std=metal4.0 -O3 -Wall -Wextra -Werror -Iruntime \
 	$(MACOS_TARGET_FLAG)
+# The video engine's request preparation reproduces MLX's arithmetic bit for
+# bit and compiles as MLX's metallib does, without fast math.
+VIDEO_PREP_METALFLAGS := $(PROD_METALFLAGS) -fno-fast-math
+VIDEO_PREP_AIRS := $(patsubst runtime/metal/kernels/%.metal,$(METAL_BUILD)/%.air, \
+	$(wildcard runtime/metal/kernels/video/prep_*.metal))
 ENGINE_CXXFLAGS := -std=c++20 -O3 -Wall -Wextra -Werror -Iruntime -I$(BUILD)/engine \
 	$(MACOS_TARGET_FLAG)
 ENGINE_OBJCXXFLAGS := $(ENGINE_CXXFLAGS) -fobjc-arc
@@ -68,6 +73,8 @@ ENGINE_OBJCXXFLAGS := $(ENGINE_CXXFLAGS) -fobjc-arc
 # byte-identical to the references (runtime/video/VENDORED).
 VIDEO_CXXFLAGS := $(ENGINE_CXXFLAGS) -ffp-contract=off
 VIDEO_OBJCXXFLAGS := $(VIDEO_CXXFLAGS) -fobjc-arc
+# The video engine writes its mp4 through AVFoundation.
+VIDEO_LINKFLAGS := -framework AVFoundation -framework CoreMedia -framework CoreVideo
 LIB := $(BUILD)/splash.metallib
 .PHONY: all clean force-build-identity install _install \
 	install-environment _install-environment \
@@ -197,6 +204,11 @@ $(METAL_BUILD)/%.air: runtime/metal/kernels/%.metal $(KERNEL_HEADERS) \
 	@mkdir -p $(dir $@)
 	$(RUN_CONFIGURED) $(METAL) $(PROD_METALFLAGS) -c $< -o $@
 
+$(VIDEO_PREP_AIRS): $(METAL_BUILD)/%.air: runtime/metal/kernels/%.metal $(KERNEL_HEADERS) \
+		| $(METAL_BUILD)
+	@mkdir -p $(dir $@)
+	$(RUN_CONFIGURED) $(METAL) $(VIDEO_PREP_METALFLAGS) -c $< -o $@
+
 $(LIB): $(PRODUCTION_AIRS)
 	$(RUN_CONFIGURED) $(METALLIB) $(BUILD_INPUTS) -o $@
 
@@ -213,9 +225,10 @@ shell-quote = '$(subst ','"'"',$(1))'
 CONFIG_DIGEST := $(shell printf '%s\0' $(BUILD_RULES_DIGEST) \
 	$(call shell-quote,$(CXX)) $(call shell-quote,$(ENGINE_CXXFLAGS)) \
 	$(call shell-quote,$(ENGINE_OBJCXXFLAGS)) $(call shell-quote,$(ENGINE_DEPFLAGS)) \
-	$(call shell-quote,$(VIDEO_OBJCXXFLAGS)) \
+	$(call shell-quote,$(VIDEO_OBJCXXFLAGS)) $(call shell-quote,$(VIDEO_LINKFLAGS)) \
 	$(call shell-quote,$(ENGINE_LINKFLAGS)) $(call shell-quote,$(AR)) \
 	$(call shell-quote,$(METAL)) $(call shell-quote,$(PROD_METALFLAGS)) \
+	$(call shell-quote,$(VIDEO_PREP_METALFLAGS)) \
 	$(call shell-quote,$(METALLIB)) | shasum -a 256 | cut -c1-16)
 RUN_CONFIGURED = $(BUILD_ID_PYTHON) $(BUILD_CONFIG_TOOL) record \
 	--output $(call shell-quote,$@) --config $(BUILD_CONFIG) --
@@ -239,6 +252,7 @@ ENGINE_METAL_RUNTIME_OBJECT := $(ENGINE_BUILD)/metal/MetalBackend.o
 ENGINE_CPP_SOURCES := \
 	runtime/ops/DraftAttention.cpp \
 	runtime/ops/Embedding.cpp \
+	runtime/ops/EncoderAttention.cpp \
 	runtime/ops/ExecutionPlans.cpp \
 	runtime/ops/GDN.cpp \
 	runtime/ops/KvCopy.cpp \
@@ -383,7 +397,7 @@ $(VIDEO_LIBRARY): $(VIDEO_OBJECTS)
 $(TARGET): $(ENGINE_MAIN_OBJECT) $(ENGINE_LIBRARY) $(VIDEO_LIBRARY) $(LIB) \
 		| $(BUILD)
 	$(RUN_CONFIGURED) $(CXX) $(ENGINE_OBJCXXFLAGS) $(ENGINE_MAIN_OBJECT) $(ENGINE_LIBRARY) \
-		$(VIDEO_LIBRARY) $(ENGINE_LINKFLAGS) -o $@
+		$(VIDEO_LIBRARY) $(ENGINE_LINKFLAGS) $(VIDEO_LINKFLAGS) -o $@
 
 clean:
 	rm -rf $(BUILD)

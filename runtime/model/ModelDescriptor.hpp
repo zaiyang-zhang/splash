@@ -61,11 +61,13 @@ inspectModelPackage(const std::filesystem::path &root);
 // an installation whose model.json states "kind": "h3-video". MiniMax-H3's
 // engine images live under weights/, in the vendored engine's layout
 // (runtime/video): per variant dit-<variant>/ (the int8 Hadamard-rotated
-// blocks, QKFIX fp16 tensors, globals and io tensors, and the SSD stream
-// image), vae/ (the W8 video VAE), preview/ (TAEH3) and vdn/ (the OpenVDN
-// stage checkpoints request preparation reads). Its text encoder is an MLX
-// Qwen3-VL checkpoint under encoder/, prepared and run like a language
-// model's target (QwenEncoder.hpp) up to `encoder.layers`.
+// blocks, QKFIX fp16 tensors, globals, io and request preparation tensors,
+// and the SSD stream image), vae/ (the W8 video VAE), audio/ (the audio
+// VAE), preview/ (TAEH3), vdn/ (the OpenVDN stage checkpoints) and fl2va/
+// (MiniMax-H3's checkpoint, whose adaLN bases request preparation reads).
+// Its text encoder is an MLX Qwen3-VL checkpoint under encoder/, prepared
+// and run like a language model's target (QwenEncoder.hpp) up to
+// `encoder.layers`.
 struct VideoVariant final {
   std::string name;
   // Denoising steps, one DiT forward each.

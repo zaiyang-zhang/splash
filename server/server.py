@@ -2389,13 +2389,6 @@ def parse_args(argv=None):
         default=None,
         help="an h3-video installation to serve /v1/videos from (install/videos.py)",
     )
-    parser.add_argument(
-        "--video-frontend",
-        type=Path,
-        default=None,
-        help="h3 checkout whose environment prepares requests and decodes audio "
-        "until the vendored engine does (runtime/video/VENDORED)",
-    )
     args = parser.parse_args(argv)
     if (
         args.default_reasoning_effort is not None
@@ -2545,7 +2538,6 @@ def main():
                 backend,
                 binary=args.binary,
                 metallib=Path(args.binary).with_name("splash.metallib"),
-                frontend=args.video_frontend,
                 hidden_states_override=os.environ.get("SPLASH_VIDEO_HIDDEN_STATES"),
                 keep_intermediates=os.environ.get("SPLASH_VIDEO_KEEP") == "1",
             )

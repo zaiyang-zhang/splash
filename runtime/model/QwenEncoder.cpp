@@ -7,6 +7,7 @@
 #include "model/SafetensorsCheckpoint.hpp"
 #include "model/WeightLayout.hpp"
 #include "ops/Embedding.hpp"
+#include "ops/EncoderAttention.hpp"
 
 #include <bit>
 #include <chrono>
@@ -272,9 +273,7 @@ std::vector<float> QwenEncoder::encode(std::span<const uint32_t> tokens, const m
     ops::Embedding::add(graph, tokenIds, weights_.tokenEmbedding, hiddenA, rows);
     submit(graph);
   }
-  const EncoderRopeParams rope{rows, l.queryHeads, l.kvHeads, l.normEpsilon};
-  const EncoderAttentionParams attend{rows, l.queryHeads, l.kvHeads,
-                                      1.0F / std::sqrt(float(l.headDimension))};
+  const ops::EncoderAttentionShape shape{rows, l.queryHeads, l.kvHeads};
   for (uint32_t index = 0; index < l.layers; ++index) {
     const QwenEncoderLayerWeights &layer = weights_.layers[index];
     const metal::MetalBuffer &input = index & 1 ? hiddenB : hiddenA;
@@ -282,11 +281,9 @@ std::vector<float> QwenEncoder::encode(std::span<const uint32_t> tokens, const m
     metal::CommandGraph graph;
     ops::Normalization::addRmsWithQ4Sums(graph, input, layer.inputNorm, normalized, sums, l.hiddenSize, rows);
     linear_.addPrefill(graph, normalized, layer.qkvProjection, qkv, sums, rows);
-    graph.add("encoder_qk_norm_rope",
-              {qkv, layer.queryNorm.buffer, layer.keyNorm.buffer, inverseFrequencies_, queries, keys, values},
-              rope, {rows, l.queryHeads + 2 * l.kvHeads, 1}, {32, 1, 1});
-    graph.add("encoder_attention", {queries, keys, values, attention}, attend, {rows, l.queryHeads, 1},
-              {32, 1, 1});
+    ops::EncoderAttention::addNormRope(graph, qkv, layer.queryNorm.buffer, layer.keyNorm.buffer,
+                                       inverseFrequencies_, queries, keys, values, shape, l.normEpsilon);
+    ops::EncoderAttention::add(graph, queries, keys, values, attention, shape);
     linear_.addPrefillSums(graph, attention, sums, layer.outputProjection, rows);
     linear_.addPrefillResidual(graph, attention, layer.outputProjection, input, attentionOutput, sums, rows);
     ops::Normalization::addRmsWithQ4Sums(graph, attentionOutput, layer.postAttentionNorm, normalized, sums,

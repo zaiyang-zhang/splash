@@ -316,8 +316,6 @@ def serve(args):
             command.extend(["--allowed-host", host])
         if video_root is not None:
             command.extend(["--video-root", str(video_root)])
-            if args.video_frontend:
-                command.extend(["--video-frontend", args.video_frontend])
         environment = dict(
             os.environ, PYTHONUNBUFFERED="1", TRANSFORMERS_VERBOSITY="error"
         )
@@ -689,11 +687,6 @@ def parse_args(argv=None):
         "--accept-video-license",
         action="store_true",
         help="accept the video model's license without the interactive prompt",
-    )
-    server.add_argument(
-        "--video-frontend",
-        help="h3 checkout whose environment prepares video requests until the "
-        "engine does (DEVELOPMENT.md, Video)",
     )
     for name in clients.INSTALL_URLS:
         commands.add_parser(name, help=f"connect {name} to the running server")

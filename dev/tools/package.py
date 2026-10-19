@@ -40,6 +40,8 @@ VIDEO_CONVERTER_FILES = (
     "convert_dit.py",
     "convert_vae.py",
     "convert_preview.py",
+    "convert_prep.py",
+    "convert_audio.py",
 )
 VIDEO_CONVERTER_MODULES = ("__init__.py", "common.py", "config.py", "safetensors.py")
 COMPLETION_FILES = (
@@ -76,7 +78,6 @@ SERVER_FILES = (
     "schema_validation.py",
     "crash_trace.py",
     "videos.py",
-    "video_audio.py",
     "chat.html",
     "favicon.svg",
 )

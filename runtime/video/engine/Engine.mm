@@ -2,7 +2,9 @@
 
 #include "video/engine/DeviceProfile.hpp"
 #include "metal/abi/video/Layout.h"
+#include "video/model/AudioWeights.hpp"
 #include "video/model/Hadamard.hpp"
+#include "video/model/Synthetic.hpp"
 #include "video/model/PreviewWeights.hpp"
 #include "video/model/VaeLatents.hpp"
 #include "video/model/VaeWeights.hpp"
@@ -85,7 +87,38 @@ Status Engine::windowTable(const Request &request, int32_t textRows, WindowTable
   return WindowTable::build(layoutOf(g, textRows), request.windowChunk, request.windowRadius, out);
 }
 
-Status Engine::loadDit(const DitInputs &inputs) {
+Status Engine::prep(const model::PrepInputs &inputs, model::Prepared &out, const std::string &dump) {
+  H3_TRY(model::Prep::run(*backend_, config_.weights, request_.variant, geometry_, inputs, out, dump));
+  log_.info("H3 prep M=%d L=%d steps=%d distinct_t=%zu total %.1fs (layout %.2fs, text+temb+noise %.2fs, adaLN %.1fs "
+            "reading %.1f GB) device_MB=%.0f",
+            out.rows, out.textRows, out.steps, out.table.size(), out.totalS, out.layoutS, out.textS, out.adalnS,
+            out.adalnReadGb, backend_->allocatedMb());
+  return {};
+}
+
+Status Engine::loadDit(const DitInputs &inputs) { return loadDitWith(inputs, nullptr); }
+
+Status Engine::loadDitSynthetic(int32_t textRows, int32_t blocks) {
+  if (request_.stream) return error(Code::Argument, "synthetic weights are resident (no --stream)");
+  model::Prepared p;
+  model::Prep::layout(geometry_, textRows, p);
+  H3_TRY(model::Prep::rope(*backend_, p));
+  std::vector<uint16_t> text(size_t(textRows) * H3_DIT_HIDDEN);
+  model::syntheticBf16(model::syntheticSeed(model::kSyntheticInputGroup, 0), text.size(), 1.0f, 0.0f, text.data());
+  if (blocks < 1 || blocks > H3_DIT_BLOCKS) return error(Code::Argument, "synthetic: blocks must be 1..50");
+  std::set<int> qkfix, used;
+  for (int b = 0; b < blocks; ++b) used.insert(b);
+  if (request_.qkfix)
+    for (int b : request_.qkfixBlocks)
+      if (b < blocks) qkfix.insert(b);
+  std::unique_ptr<model::DitWeights> weights;
+  H3_TRY(model::DitWeights::synthetic(*backend_, qkfix, used, weights));
+  H3_TRY(loadDitWith({textRows, p.tags.data(), p.rope.data(), text.data()}, std::move(weights)));
+  dit_->scheduler->setBlocks(blocks);
+  return {};
+}
+
+Status Engine::loadDitWith(const DitInputs &inputs, std::unique_ptr<model::DitWeights> synthetic) {
   if (dit_) return error(Code::State, "DiT already loaded");
   if (inputs.textRows < 1 || !inputs.tags || !inputs.rope || !inputs.text)
     return error(Code::Argument, "DiT inputs incomplete");
@@ -103,7 +136,8 @@ Status Engine::loadDit(const DitInputs &inputs) {
   }
   H3_TRY(WindowTable::build(lay, request_.windowChunk, request_.windowRadius, dit->table));
   H3_TRY(dit->table.upload(b));
-  H3_TRY(model::DitWeights::load(b, ditDirectory(), qkfix, request_.stream, dit->weights));
+  if (synthetic) dit->weights = std::move(synthetic);
+  else H3_TRY(model::DitWeights::load(b, ditDirectory(), qkfix, request_.stream, dit->weights));
   if (request_.stream) {
     const std::string image = request_.streamImage.empty() ? ditDirectory() + "/stream.bin" : request_.streamImage;
     H3_TRY(WeightStream::open(b, image, request_.streamSlots, dit->stream));
@@ -258,6 +292,20 @@ Status Engine::preview(const float *videoRows, uint8_t *frames, uint8_t *yuv, Pr
   H3_TRY(preview_->decode(z.data(), g.latentFrames, frames, yuv, stats));
   log_.info("H3 preview %d frames wall %.2fs gpu %.2fs nonfinite %lld", stats.frames, stats.wallS, stats.gpuS,
             static_cast<long long>(stats.nonfinite));
+  return {};
+}
+
+Status Engine::decodeAudio(const float *audioRows, float *wav, AudioStats &stats) {
+  if (!audioRows || !wav) return error(Code::Argument, "audio decode: null rows or waveform");
+  if (!audio_) {
+    std::unique_ptr<model::AudioWeights> weights;
+    H3_TRY(model::AudioWeights::load(*backend_, config_.weights + "/audio", weights));
+    H3_TRY(ops::AudioDecoder::create(*backend_, std::move(weights), audio_));
+  }
+  H3_TRY(audio_->decode(audioRows, geometry_.audioRows / 2, wav, stats));
+  log_.info("H3 audio %lld samples x 2 wall %.2fs gpu %.2fs nonfinite %lld device_MB %.0f",
+            static_cast<long long>(stats.samples), stats.wallS, stats.gpuS, static_cast<long long>(stats.nonfinite),
+            stats.deviceMb);
   return {};
 }
 

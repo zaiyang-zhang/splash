@@ -6,11 +6,14 @@
  * weights, the activations and every kernel choice. Phases:
  *
  *   h3_create            device, kernel library, request geometry
+ *   h3_prep              text hidden states -> layout, RoPE, adaLN tables, refined text, schedule, noise
  *   h3_dit_load          DiT weights (resident or SSD-streamed), key-range table, activations; prepared layout
  *   h3_denoise           all steps: forward + Euler update, per-step callback      (or h3_dit_forward: one forward)
  *   h3_dit_release       frees the DiT memory (weights, slots, activations)
  *   h3_decode            video VAE: final latents -> uint8 frames
  *   h3_preview           TAEH3 preview decoder: final latents -> uint8 frames (+ yuv420p)
+ *   h3_decode_audio      audio VAE (BigVGAN): final audio latents -> stereo waveform, 32 kHz
+ *   h3_write_mp4         (no engine) uint8 frames + waveform -> H.264 / AAC mp4 (AVFoundation)
  *   h3_destroy
  *
  * Every call returns H3_OK or an error code; h3_error() has the message. Inputs are borrowed for the duration of the
@@ -26,7 +29,7 @@
 extern "C" {
 #endif
 
-#define H3_ABI_VERSION 1
+#define H3_ABI_VERSION 2
 #define H3_MAX_QKFIX_BLOCKS 8
 
 typedef enum h3_status {
@@ -71,9 +74,40 @@ typedef struct h3_geometry {
   int32_t video_rows, audio_rows; /* DiT latent rows: [video_rows][96], [audio_rows][32] */
   int32_t decode_frames;          /* frames of h3_decode */
   int32_t preview_frames;         /* frames of h3_preview */
+  int32_t audio_samples;          /* samples per channel of h3_decode_audio (800 per audio latent) */
 } h3_geometry;
 
-/* Prepared layout of the packed DiT sequence [text L | audio | video] (python -m h3 prep). */
+/* Text conditioning of h3_prep: the hidden states of Qwen3-VL-32B-Instruct after decoder layer 50 of 64
+ * (hidden_states[50], unnormalized), fp32 [text_rows][5120], all rows text (the prompt tokenized without special
+ * tokens or chat template). */
+typedef struct h3_prep_inputs {
+  const float *hidden;
+  int32_t text_rows; /* >= 2 */
+  int32_t steps;     /* 0: the variant's (turbo 8, default 50) */
+  uint64_t seed;     /* noise: MLX random.normal under mx.random.seed(seed) */
+} h3_prep_inputs;
+
+/* Outputs of h3_prep, owned by the engine (valid until the next h3_prep, h3_prep_release or h3_destroy). They are
+ * bit-identical to the former Python prep and feed h3_dit_load (text_rows, tags, rope, text) and h3_denoise
+ * (ada_blocks, ada_final, video_t, audio_t, video_sigmas, audio_sigmas, video_noise, audio_noise) directly. */
+typedef struct h3_prepared {
+  int32_t text_rows, rows, steps, distinct_t;
+  const uint8_t *tags;                      /* [rows] 1 text, 2 audio, 0 video */
+  const uint16_t *rope;                     /* bf16 [rows][96]: cos 48 | sin 48 */
+  const float *pos;                         /* [rows][3] (t, h, w) */
+  const uint16_t *text;                     /* bf16 [text_rows][5376] refined text */
+  const uint16_t *ada_blocks;               /* bf16 [steps][50][3][6][5376] */
+  const uint16_t *ada_final;                /* bf16 [steps][3][2][5376] */
+  const float *video_t, *audio_t;           /* [steps] */
+  const float *video_sigmas, *audio_sigmas; /* [steps + 1] */
+  const float *table;                       /* [distinct_t] sorted distinct timesteps */
+  const int64_t *video_index, *audio_index; /* [steps] into table */
+  const float *video_noise;                 /* [video_rows][96] */
+  const float *audio_noise;                 /* [audio_rows][32] */
+  double seconds;
+} h3_prepared;
+
+/* Prepared layout of the packed DiT sequence [text L | audio | video] (h3_prep). */
 typedef struct h3_dit_inputs {
   int32_t text_rows;     /* L */
   const uint8_t *tags;   /* [M] modality: 0 video, 1 text, 2 audio */
@@ -123,6 +157,21 @@ typedef struct h3_preview_stats {
   double device_mb;
 } h3_preview_stats;
 
+typedef struct h3_audio_stats {
+  double wall_s, gpu_s;
+  int64_t samples, nonfinite; /* samples per channel; non-finite values in the waveform */
+  double device_mb;
+} h3_audio_stats;
+
+typedef struct h3_mp4_stats {
+  double wall_s;
+  int32_t frames;
+  int64_t audio_samples; /* per channel */
+  double video_seconds, audio_seconds;
+  int64_t bytes;
+  int32_t video_bitrate; /* bits/s */
+} h3_mp4_stats;
+
 /* Called after every denoising step with the updated latents ([video_rows][96], [audio_rows][32]). */
 typedef void (*h3_step_callback)(void *user, int32_t step, const h3_forward_stats *stats, const float *video,
                                  const float *audio);
@@ -137,6 +186,14 @@ h3_status h3_create(const h3_config *config, const h3_request *request, h3_engin
 void h3_destroy(h3_engine *engine);
 const char *h3_error(const h3_engine *engine);
 
+/* Request-constant DiT inputs (weights: <weights>/dit-<variant>/prep.safetensors, vdn-w8-blockNN / vdn-globals LoRA
+ * factors, <weights>/fl2va/transformer adaLN bases). */
+h3_status h3_prep(h3_engine *engine, const h3_prep_inputs *inputs, h3_prepared *out);
+/* The last h3_prep's arrays as a prep directory (layout.npz, sched.npz, ada_blocks.npy, ada_final.npy, text_ref.npy,
+ * noise.npz, prep.json; the files of the former Python prep). */
+h3_status h3_prep_write(h3_engine *engine, const char *dir);
+void h3_prep_release(h3_engine *engine);
+
 h3_status h3_dit_load(h3_engine *engine, const h3_dit_inputs *inputs);
 h3_status h3_dit_info_of(const h3_engine *engine, h3_dit_info *out);
 h3_status h3_dit_forward(h3_engine *engine, const uint16_t *ada_blocks, const uint16_t *ada_final,
@@ -150,6 +207,15 @@ void h3_dit_release(h3_engine *engine);
 h3_status h3_decode(h3_engine *engine, const float *video_latents, uint8_t *frames, h3_decode_stats *stats);
 h3_status h3_preview(h3_engine *engine, const float *video_latents, uint8_t *frames, uint8_t *yuv420,
                      h3_preview_stats *stats);
+/* audio_latents: final audio rows [audio_rows][32] (channel-major, as h3_denoise returns them); wav: [2][audio_samples]
+ * fp32 in [-1, 1], 32 kHz. */
+h3_status h3_decode_audio(h3_engine *engine, const float *audio_latents, float *wav, h3_audio_stats *stats);
+
+/* MP4 through AVFoundation (no engine needed): frames uint8 RGB [frame_count][height][width][3] at 24 fps -> H.264
+ * High (13 Mb/s at 1344 x 768, the libx264 CRF 18 quality), wav (nullable) fp32 [2][samples] at 32 kHz -> AAC-LC
+ * 192 kb/s. Every frame is kept; both tracks start at 0. */
+h3_status h3_write_mp4(const char *path, const uint8_t *frames, int32_t frame_count, int32_t width, int32_t height,
+                       const float *wav, int64_t samples, h3_mp4_stats *stats);
 
 #ifdef __cplusplus
 }

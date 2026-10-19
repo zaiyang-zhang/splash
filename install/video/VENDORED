@@ -1,15 +1,17 @@
 MiniMax-H3 weight converters, vendored
 
-Source: the h3 engine repository, branch main, commit
-8c4a054674787175d293232dbc0c884eceb9cad4, copied unchanged without history:
+Source: the h3 engine repository, branch native, commit 03881cc, copied
+unchanged without history, with the runtime they convert for
+(runtime/video/VENDORED):
 
-  h3 tools/convert_dit.py, convert_vae.py, convert_preview.py  -> install/video/
-  h3 h3/common.py, config.py, safetensors.py                   -> install/video/h3/
+  h3 tools/convert_{dit,vae,preview,prep,audio}.py  -> install/video/
+  h3 h3/common.py, config.py, safetensors.py        -> install/video/h3/
 
 install/videos.py runs them once per installation, with install/video as the
 working directory and import path, into the prepared-weight cache
-(video/<key>, the key hashing these files and the source commits). The VAE
-converter computes its rotary tables with MLX (H3_MLX_PORT); give it an
-interpreter that has MLX with --converter-python. The runtime the images are
-for is runtime/video (runtime/video/VENDORED); the two are vendored from the
-same commit.
+(video/<key>, the key hashing these files and the source commits): the DiT
+blocks, QKFIX tensors, io tensors and SSD stream image and the request
+preparation's tensors per variant, the W8 video VAE, the audio VAE and TAEH3.
+They read numpy and safetensors only, but for the video VAE's rotary tables,
+which convert_vae.py computes with MLX (H3_MLX_PORT); give the installer an
+interpreter that has MLX with --converter-python.

@@ -435,6 +435,7 @@ VideoModelDescriptor inspectVideoModel(const std::filesystem::path &root) {
       requireFile(dit / "manifest.json", "DiT manifest");
       requireFile(dit / "vdn-globals.safetensors", "DiT globals");
       requireFile(dit / "io.safetensors", "DiT io tensors");
+      requireFile(dit / "prep.safetensors", "request preparation tensors");
       for (uint32_t block = 0; block < 50; ++block) {
         char name[64];
         snprintf(name, sizeof name, "vdn-w8-block%02u.safetensors", block);
@@ -444,6 +445,8 @@ VideoModelDescriptor inspectVideoModel(const std::filesystem::path &root) {
       result.variants.push_back(std::move(variant));
     }
     requireFile(result.weightsDirectory / "vae" / "manifest_w8.json", "video VAE manifest");
+    requireFile(result.weightsDirectory / "audio" / "manifest.json", "audio VAE manifest");
+    requireFile(result.weightsDirectory / "fl2va" / "transformer" / "config.json", "FL2VA transformer");
     requireFile(result.weightsDirectory / "preview" / "manifest.json", "preview decoder manifest");
     return result;
   }

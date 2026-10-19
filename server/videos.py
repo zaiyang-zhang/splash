@@ -7,11 +7,10 @@ A job runs its phases in order on one worker thread:
   (HiddenStatesRequest), while the language model is still resident;
 - the engine hands the GPU over (Exclusive acquire): it drops its cached
   prefixes, KV backing and states and ends its weights' residency;
-- prep: the request's DiT inputs (layout, RoPE, adaLN tables, refined text,
-  schedule, noise);
-- denoise, preview, decode: `splash video-native`, a process of its own whose
-  exit releases every allocation; each denoising step advances the progress;
-- mux: the frames and the audio track into an mp4;
+- `splash video-native`, a process of its own whose exit releases every
+  allocation: prep (the DiT inputs: layout, RoPE, adaLN tables, refined
+  text, schedule, noise), denoise, where each step advances the progress,
+  preview (TAEH3, when asked), decode, audio and mux into an mp4;
 - the engine takes the GPU back (Exclusive release).
 
 The GPU is exclusive: from the moment a job is admitted until the last one
@@ -24,7 +23,6 @@ DELETE cancels a running job at its next step boundary.
 from __future__ import annotations
 
 import json
-import os
 import secrets
 import shutil
 import signal
@@ -60,9 +58,10 @@ MAX_LISTED_JOBS = 100
 PHASE_PROGRESS = {
     "text": 2,
     "prep": 5,
-    "denoise": 80,
-    "preview": 81,
-    "decode": 95,
+    "denoise": 85,
+    "preview": 86,
+    "decode": 94,
+    "audio": 97,
     "mux": 100,
 }
 # A cancelled job's process stops at its next step boundary; after this it is
@@ -489,13 +488,10 @@ class VideoInstallation:
 
 
 class H3Pipeline:
-    """The phases of a MiniMax-H3 job: the engine's text encoder and handoff
-    through the native runtime, `splash video-native` for the GPU phases.
-
-    Until the vendored engine prepares requests natively, the prep phase and
-    the audio track run the h3 Python frontend (`frontend`, an h3 checkout
-    with its environment), and ffmpeg muxes; runtime/video/VENDORED states
-    which engine commit this is."""
+    """The phases of a MiniMax-H3 job: the engine's text encoder and memory
+    handoff through the native runtime, then `splash video-native`, which
+    prepares the request, denoises, decodes the video and the audio and
+    writes the mp4 (runtime/video/VideoJob.hpp)."""
 
     def __init__(
         self,
@@ -505,7 +501,6 @@ class H3Pipeline:
         *,
         binary,
         metallib,
-        frontend=None,
         hidden_states_override=None,
         keep_intermediates=False,
     ):
@@ -516,7 +511,6 @@ class H3Pipeline:
         self.backend = backend
         self.binary = str(binary)
         self.metallib = str(metallib)
-        self.frontend = Path(frontend) if frontend else None
         # A saved prompt embedding (npz with `hidden`) used instead of the
         # text encoder, for the byte-identity test against the golden run.
         self.hidden_states_override = hidden_states_override
@@ -543,48 +537,6 @@ class H3Pipeline:
     def _check(self, job):
         if job.cancelled.is_set():
             raise VideoCancelled()
-
-    def _spawn(self, job, command, *, env=None, stdout=subprocess.PIPE):
-        # stderr goes to the job's log, which the job's error quotes.
-        with (job.directory / "stderr.log").open("a") as log:
-            process = subprocess.Popen(
-                command,
-                stdout=stdout,
-                stderr=log,
-                env=env,
-                text=True,
-            )
-        with self.process_lock:
-            self.processes[job.id] = process
-        if job.cancelled.is_set():
-            self.cancel(job)
-        return process
-
-    def _reap(self, job, process, phase):
-        """Waits for the process; returns its peak resident bytes."""
-        try:
-            _, status, usage = os.wait4(process.pid, 0)
-            process.returncode = os.waitstatus_to_exitcode(status)
-        except ChildProcessError:
-            usage = None
-            process.wait()
-        with self.process_lock:
-            self.processes.pop(job.id, None)
-        if job.cancelled.is_set():
-            raise VideoCancelled()
-        if process.returncode:
-            try:
-                stderr = (job.directory / "stderr.log").read_text(errors="replace")
-            except OSError:
-                stderr = ""
-            tail = stderr.strip().splitlines()[-3:]
-            raise VideoFailed(
-                f"{phase}_failed",
-                f"{phase} exited with status {process.returncode}"
-                + (": " + " | ".join(tail) if tail else ""),
-            )
-        # ru_maxrss is in bytes on macOS.
-        return usage.ru_maxrss if usage else 0
 
     # -- phases --------------------------------------------------------------
 
@@ -616,9 +568,7 @@ class H3Pipeline:
             self._check(job)
             if handoff is None:
                 handoff = self._acquire(job, service)
-            self._prep(job, service, directory)
             self._generate(job, service, directory)
-            self._mux(job, service, directory)
         finally:
             if handoff is not None:
                 restored = self.runtime.exclusive(False)
@@ -633,15 +583,8 @@ class H3Pipeline:
                     ),
                 )
             if not self.keep_intermediates:
-                for name in (
-                    "frames.rgb",
-                    "preview.yuv",
-                    "final.npz",
-                    "audio.wav",
-                    "prompt.npz",
-                ):
+                for name in ("final.npz", "prompt.npz"):
                     (directory / name).unlink(missing_ok=True)
-                shutil.rmtree(directory / "prep", ignore_errors=True)
 
     def _acquire(self, job, service):
         """The engine's memory handed to the job (Exclusive acquire)."""
@@ -680,8 +623,10 @@ class H3Pipeline:
                 ],
                 np.int32,
             )
-            if not len(ids):
-                raise VideoFailed("invalid_prompt", "the prompt has no tokens")
+            if len(ids) < 2:
+                raise VideoFailed(
+                    "invalid_prompt", "the prompt needs at least two tokens"
+                )
             try:
                 event = self.runtime.hidden_states(
                     tuple(int(token) for token in ids), self.installation.layer
@@ -695,95 +640,52 @@ class H3Pipeline:
                 event.rows, event.width
             )
             wall = event.wall_micros / 1e6
-        # The DiT tags every text row 1 (text); a text-only prompt has no
-        # vision rows.
+        # Every row of a text-only prompt is text (tag 1).
         np.savez(
             directory / "prompt.npz",
             hidden=hidden,
             tags=np.ones(len(ids), np.int64),
             ids=ids,
-            fake=0,
         )
         return {"tokens": int(len(ids)), "encoder_seconds": round(wall, 3)}
-
-    def _frontend(self):
-        if self.frontend is None:
-            raise VideoFailed(
-                "video_frontend_missing",
-                "this engine prepares requests with the h3 frontend; "
-                "start the server with --video-frontend",
-            )
-        python = self.frontend / ".venv" / "bin" / "python"
-        env = dict(
-            os.environ,
-            PYTHONPATH=str(self.frontend),
-            H3_WEIGHTS_DIR=str(self.installation.weights),
-        )
-        return str(python), env
-
-    def _prep(self, job, service, directory):
-        started = time.monotonic()
-        service._report(job, phase="prep")
-        python, env = self._frontend()
-        request = job.request
-        process = self._spawn(
-            job,
-            [
-                python,
-                "-m",
-                "h3",
-                "prep",
-                "--prompt",
-                str(directory / "prompt.npz"),
-                "--frames",
-                str(request.frames),
-                "--variant",
-                request.variant,
-                "--seed",
-                str(request.seed),
-                "--out",
-                str(directory / "prep"),
-                "--no-lock",
-            ],
-            env=env,
-            stdout=subprocess.DEVNULL,
-        )
-        peak = self._reap(job, process, "prep")
-        service._report(
-            job,
-            progress=PHASE_PROGRESS["prep"],
-            timing=(
-                "prep",
-                {
-                    "seconds": round(time.monotonic() - started, 3),
-                    "peak_resident_bytes": peak,
-                },
-            ),
-        )
 
     def _generate(self, job, service, directory):
         request = job.request
         variant = self.installation.variants[request.variant]
-        phases = ["denoise"] + (["preview"] if request.preview else []) + ["decode"]
+        outputs = ["video"] + (["audio"] if request.audio else [])
+        outputs += ["preview"] if request.preview else []
         command = [
             self.binary,
             "video-native",
             str(self.installation.weights),
             self.metallib,
-            str(directory / "prep"),
+            str(directory / "prompt.npz"),
             str(directory),
             "--variant",
             request.variant,
-            "--phases",
-            ",".join(phases),
+            "--frames",
+            str(request.frames),
+            "--seed",
+            str(request.seed),
+            "--outputs",
+            ",".join(outputs),
         ]
         # The DiT streams its block weights from SSD when the installation
         # has the stream image: 15 s fits in ~15 GB instead of ~32 GB, at
         # the same forward time.
         if variant.get("stream"):
             command.append("--stream")
-        service._report(job, phase="denoise")
-        process = self._spawn(job, command)
+        if self.keep_intermediates:
+            command += ["--save-prep", "--frames-rgb"]
+        service._report(job, phase="prep")
+        with (directory / "stderr.log").open("a") as log:
+            process = subprocess.Popen(
+                command, stdout=subprocess.PIPE, stderr=log, text=True
+            )
+        with self.process_lock:
+            self.processes[job.id] = process
+        if job.cancelled.is_set():
+            self.cancel(job)
         peak = 0
         failure = None
         for line in process.stdout:
@@ -804,7 +706,7 @@ class H3Pipeline:
                 name = event["phase"]
                 service._report(
                     job,
-                    progress=PHASE_PROGRESS[name],
+                    progress=PHASE_PROGRESS.get(name),
                     timing=(
                         name,
                         {
@@ -814,91 +716,29 @@ class H3Pipeline:
                     ),
                 )
                 if name == "preview":
-                    self._encode_preview(job, directory)
                     service._preview_ready(job)
             elif kind == "error":
                 failure = event.get("message", "")
         process.stdout.close()
-        try:
-            self._reap(job, process, "video_native")
-        except VideoFailed:
-            if failure is None:
-                raise
-        if failure is not None:
-            raise VideoFailed("video_engine_failed", failure)
+        status = process.wait()
+        with self.process_lock:
+            self.processes.pop(job.id, None)
+        if job.cancelled.is_set():
+            raise VideoCancelled()
+        if failure is not None or status:
+            raise VideoFailed(
+                "video_engine_failed",
+                failure
+                or f"video-native exited with status {status}: {self._log_tail(job)}",
+            )
         service._report(job, timing=("video_native", {"peak_footprint_bytes": peak}))
 
-    def _ffmpeg(self, job, arguments):
-        ffmpeg = shutil.which("ffmpeg")
-        if ffmpeg is None:
-            raise VideoFailed("ffmpeg_missing", "ffmpeg is not on PATH")
-        process = self._spawn(
-            job,
-            [ffmpeg, "-y", "-loglevel", "error", *arguments],
-            stdout=subprocess.DEVNULL,
-        )
-        self._reap(job, process, "mux")
-
-    def _encode_preview(self, job, directory):
-        width, height = VIDEO_SIZE.split("x")
-        self._ffmpeg(
-            job,
-            [
-                "-f", "rawvideo", "-pix_fmt", "yuv420p", "-s", f"{width}x{height}",
-                "-r", "24", "-i", str(directory / "preview.yuv"),
-                "-c:v", "libx264", "-crf", "18", "-pix_fmt", "yuv420p",
-                str(directory / "preview.mp4"),
-            ],
-        )  # fmt: skip
-
-    def _mux(self, job, service, directory):
-        started = time.monotonic()
-        service._report(job, phase="mux")
-        peak = 0
-        audio = []
-        if job.request.audio:
-            python, env = self._frontend()
-            process = self._spawn(
-                job,
-                [
-                    python,
-                    str(Path(__file__).with_name("video_audio.py")),
-                    str(directory / "final.npz"),
-                    str(job.request.frames),
-                    str(directory / "audio.wav"),
-                ],
-                env=env,
-                stdout=subprocess.DEVNULL,
+    @staticmethod
+    def _log_tail(job):
+        try:
+            lines = (
+                (job.directory / "stderr.log").read_text(errors="replace").splitlines()
             )
-            peak = self._reap(job, process, "audio")
-            audio = [
-                "-i",
-                str(directory / "audio.wav"),
-                "-c:a",
-                "aac",
-                "-b:a",
-                "192k",
-                "-shortest",
-            ]
-        width, height = VIDEO_SIZE.split("x")
-        self._ffmpeg(
-            job,
-            [
-                "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", f"{width}x{height}",
-                "-r", "24", "-i", str(directory / "frames.rgb"),
-                *audio,
-                "-c:v", "libx264", "-crf", "18", "-pix_fmt", "yuv420p",
-                str(directory / "video.mp4"),
-            ],
-        )  # fmt: skip
-        service._report(
-            job,
-            progress=PHASE_PROGRESS["mux"],
-            timing=(
-                "mux",
-                {
-                    "seconds": round(time.monotonic() - started, 3),
-                    "peak_resident_bytes": peak,
-                },
-            ),
-        )
+        except OSError:
+            return ""
+        return " | ".join(lines[-3:])

@@ -15,8 +15,10 @@ selection link models/.video/OWNER/REPO points to. It holds:
                (model/QwenEncoder.hpp); `prepare` prepares it once
   tokenizer/   MiniMax-H3's tokenizer (FL2VA/tokenizer), which the server
                encodes prompts with
-  weights/     the engine images (dit-turbo, dit-default, vae, preview) and
-               the OpenVDN stage checkpoints request preparation reads (vdn)
+  weights/     the engine images (dit-turbo and dit-default with their prep
+               tensors, vae, audio, preview), the OpenVDN stage checkpoints
+               (vdn) and MiniMax-H3's FL2VA checkpoint (fl2va), whose adaLN
+               bases request preparation reads
 
 The weights are downloaded under their publishers' licenses, which the user
 acknowledges once per license text: MiniMax H3 and its derivatives (the
@@ -58,7 +60,13 @@ CONVERTERS = paths.ROOT / "install" / "video"
 VIDEO = ".video"
 KIND = "h3-video"
 # The engine images an installation links under weights/.
-IMAGE_DIRECTORIES = ("vae", "preview")
+IMAGE_DIRECTORIES = ("vae", "audio", "preview")
+# Each image directory's manifest, which adoption requires.
+MANIFESTS = {
+    "vae": "manifest_w8.json",
+    "audio": "manifest.json",
+    "preview": "manifest.json",
+}
 
 
 @dataclass(frozen=True)
@@ -368,10 +376,15 @@ def convert(family: VideoFamily, sources, key: str, python) -> Path:
         ).parent
         run_converter(
             python,
-            ["convert_vae.py", "--src", str(fl2va), "--out", str(staging / "vae"),
+            ["convert_vae.py", "--src", str(fl2va / "video_vae"), "--out", str(staging / "vae"),
              "--tag", "w8", "--i8", "qkv,o,1,2"],
             environment,
         )  # fmt: skip
+        run_converter(
+            python,
+            ["convert_audio.py", str(fl2va / "audio_vae"), str(staging / "audio")],
+            environment,
+        )
         taeh3 = sources["taeh3"][1]["safetensors/taeh3.safetensors"]
         run_converter(
             python,
@@ -379,6 +392,7 @@ def convert(family: VideoFamily, sources, key: str, python) -> Path:
             environment,
         )
         vdn.unlink()
+        (staging / "fl2va").unlink()
         (staging / "complete.json").write_bytes(models.json_bytes({"key": key}))
         os.replace(staging, published)
     finally:
@@ -388,14 +402,17 @@ def convert(family: VideoFamily, sources, key: str, python) -> Path:
 
 def adopt(converted: Path, family: VideoFamily) -> Path:
     """Images an h3 checkout converted (its weights/ directory), checked for
-    every directory the engine reads."""
+    every file the engine reads first."""
     converted = converted.resolve()
-    for name in [f"dit-{v.name}" for v in family.variants] + list(IMAGE_DIRECTORIES):
-        manifest = "manifest_w8.json" if name == "vae" else "manifest.json"
-        if not (converted / name / manifest).is_file():
-            raise VideoError(
-                f"{converted / name} holds no converted images ({manifest})"
-            )
+    required = [
+        f"dit-{v.name}/{name}"
+        for v in family.variants
+        for name in ("manifest.json", "prep.safetensors")
+    ]
+    required += [f"{name}/{manifest}" for name, manifest in MANIFESTS.items()]
+    for name in required:
+        if not (converted / name).is_file():
+            raise VideoError(f"{converted} holds no converted {name}")
     return converted
 
 
@@ -490,10 +507,12 @@ def prepare(args):
             }
         )
         names = [f"dit-{variant.name}" for variant in family.variants]
-        names += list(IMAGE_DIRECTORIES) + ["vdn"]
+        names += list(IMAGE_DIRECTORIES)
         links.update({f"weights/{name}": weights / name for name in names})
-        if not args.converted:
-            links["weights/vdn"] = snapshot_root(sources["vdn"][0])
+        links["weights/fl2va"] = snapshot_root(h3_repo) / "FL2VA"
+        links["weights/vdn"] = (
+            weights / "vdn" if args.converted else snapshot_root(sources["vdn"][0])
+        )
         record = {
             "version": 1,
             "kind": KIND,
@@ -562,7 +581,8 @@ def parse_args(argv=None):
     parser.add_argument(
         "--converter-python",
         type=Path,
-        help="interpreter for the converters (the VAE's needs MLX)",
+        help="interpreter for the converters (the video VAE's computes its rotary "
+        "tables with MLX, H3_MLX_PORT)",
     )
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("prepare")

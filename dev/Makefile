@@ -121,10 +121,9 @@ test-release-real: preflight $(TARGET) agent-preflight verify-build-identity
 
 # The video model (DEVELOPMENT.md, Video). VIDEO_REFERENCES is a directory of
 # the 3 s golden request's prep/, final.npz, frames.npy and
-# preview_frames.npy; VIDEO_FRONTEND an h3 checkout with its environment.
+# preview_frames.npy and the golden prompt's hidden states, prompt.npz.
 VIDEO_MODEL ?= MiniMaxAI/MiniMax-H3
 VIDEO_REFERENCES ?=
-VIDEO_FRONTEND ?=
 VIDEO_ROOT = $(shell $(PYTHON) install/videos.py --video-model "$(VIDEO_MODEL)" link)
 
 .PHONY: test-video-real test-video-http-real
@@ -143,7 +142,6 @@ test-video-http-real: preflight $(TARGET)
 	}
 	TRANSFORMERS_VERBOSITY=error $(PYTHON) dev/tests/video_real.py --model "$(MODEL)" \
 		--package "$(MODEL_ROOT)" --video-root "$(VIDEO_ROOT)" \
-		$(if $(VIDEO_FRONTEND),--video-frontend "$(VIDEO_FRONTEND)") \
 		--reference "$(VIDEO_REFERENCES)/final.npz" \
 		--reference-frames "$(VIDEO_REFERENCES)/frames.npy" \
 		--output build/release/video-http.json

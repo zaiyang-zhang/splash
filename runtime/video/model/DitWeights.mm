@@ -2,7 +2,9 @@
 
 #include "metal/abi/video/Layout.h"
 #include "video/model/Json.hpp"
+#include "video/model/Synthetic.hpp"
 
+#include <cmath>
 #include <cstring>
 #include <tuple>
 
@@ -183,6 +185,70 @@ Status DitWeights::loadIo(metal::MetalBackend &backend) {
   H3_TRY(put(v, io_.audioOut, "final_layer.audio_out.weight"));
   H3_TRY(readFloat(file, "final_layer.audio_out.bias", {KA}, v));
   H3_TRY(put(v, io_.audioOutBias, "final_layer.audio_out.bias"));
+  return {};
+}
+
+Status DitWeights::synthetic(metal::MetalBackend &backend, const std::set<int> &qkfixBlocks, const std::set<int> &blocks,
+                             std::unique_ptr<DitWeights> &out) {
+  auto w = std::unique_ptr<DitWeights>(new DitWeights());
+  w->blocks_.resize(H3_DIT_BLOCKS);
+  SyntheticFiller f(backend);
+  // int8 values are uniform on [-127, 127] (std 73.3): row scales 1 / (73.3 sqrt(K)) x (1 +- 0.25) give unit gain
+  auto rowScale = [](int64_t K) { return static_cast<float>(1.0 / (73.32 * std::sqrt(double(K)))); };
+  auto uniform = [](int64_t fanIn) { return static_cast<float>(std::sqrt(3.0 / double(fanIn))); };
+  for (int b = 0; b < H3_DIT_BLOCKS; ++b) {
+    if (!blocks.empty() && !blocks.count(b)) continue;
+    DitBlockWeights &x = w->blocks_[b];
+    auto seed = [b](int id) { return syntheticSeed(b, id); };
+    H3_TRY(f.allocate(size_t((QKV + G) * D), H3_SYN_I8, seed(0), 0, 0, x.qkvg, "synthetic qkvg"));
+    H3_TRY(f.allocate(size_t(QKV + G), H3_SYN_F32, seed(1), 0.25f * rowScale(D), rowScale(D), x.qkvgScale, "scale"));
+    H3_TRY(f.allocate(size_t(D * C), H3_SYN_I8, seed(2), 0, 0, x.out, "synthetic out"));
+    H3_TRY(f.allocate(size_t(D), H3_SYN_F32, seed(3), 0.25f * rowScale(C), rowScale(C), x.outScale, "scale"));
+    H3_TRY(f.allocate(size_t(2 * F * D), H3_SYN_I8, seed(4), 0, 0, x.fc1, "synthetic fc1"));
+    H3_TRY(f.allocate(size_t(2 * F), H3_SYN_F32, seed(5), 0.25f * rowScale(D), rowScale(D), x.fc1Scale, "scale"));
+    H3_TRY(f.allocate(size_t(D * F), H3_SYN_I8, seed(6), 0, 0, x.fc2, "synthetic fc2"));
+    H3_TRY(f.allocate(size_t(D), H3_SYN_F32, seed(7), 0.25f * rowScale(F), rowScale(F), x.fc2Scale, "scale"));
+    H3_TRY(f.allocate(size_t(D * C), H3_SYN_I8, seed(8), 0, 0, x.outLinear, "synthetic out_linear"));
+    H3_TRY(f.allocate(size_t(D), H3_SYN_F32, seed(9), 0.25f * rowScale(C), rowScale(C), x.outLinearScale, "scale"));
+    H3_TRY(f.allocate(size_t(D), H3_SYN_BF16, seed(10), 0.1f, 1.0f, x.norm1, "norm1"));
+    H3_TRY(f.allocate(size_t(D), H3_SYN_BF16, seed(11), 0.1f, 1.0f, x.norm2, "norm2"));
+    H3_TRY(f.allocate(size_t(HD), H3_SYN_BF16, seed(12), 0.1f, 1.0f, x.qNorm, "q_norm"));
+    H3_TRY(f.allocate(size_t(HD), H3_SYN_BF16, seed(13), 0.1f, 1.0f, x.kNorm, "k_norm"));
+    H3_TRY(f.allocate(size_t(HEADS), H3_SYN_F32, seed(14), 0.5f, 0.0f, x.sgBias, "sg_bias"));
+    H3_TRY(f.allocate(size_t(C * HD), H3_SYN_F16, seed(15), uniform(HD), 0.0f, x.ogUp, "og_up"));
+    H3_TRY(f.allocate(size_t(C), H3_SYN_F32, seed(16), 0.1f, 0.0f, x.ogBias, "og_bias"));
+    H3_TRY(f.allocate(size_t(HD * D), H3_SYN_F32, seed(17), uniform(D), 0.0f, x.alphaDown, "alpha_down"));
+    H3_TRY(f.allocate(size_t(C * HD), H3_SYN_F32, seed(18), uniform(HD), 0.0f, x.alphaUp, "alpha_up"));
+    H3_TRY(f.allocate(size_t(C), H3_SYN_F32, seed(19), 0.5f, 0.0f, x.dtBias, "dt_bias"));
+    H3_TRY(f.allocate(size_t(HEADS), H3_SYN_F32, seed(20), 0.5f, 0.0f, x.aLog, "A_log"));
+    H3_TRY(f.allocate(size_t(25 * C), H3_SYN_F16, seed(21), 0.2f, 0.0f, x.kSpatial, "k_sp"));
+    H3_TRY(f.allocate(size_t(5 * C), H3_SYN_F16, seed(22), 0.2f, 0.0f, x.kTemporal, "k_tm"));
+    H3_TRY(f.allocate(size_t(25 * C), H3_SYN_F16, seed(23), 0.2f, 0.0f, x.vSpatial, "v_sp"));
+    H3_TRY(f.allocate(size_t(5 * C), H3_SYN_F16, seed(24), 0.2f, 0.0f, x.vTemporal, "v_tm"));
+    H3_TRY(f.allocate(size_t(HD), H3_SYN_F32, seed(25), 0.1f, 1.0f, x.branchNorm, "branch norm"));
+    if (qkfixBlocks.count(b)) {
+      QkFixWeights &q = w->qkfix_[b];
+      H3_TRY(f.allocate(size_t(QKV * D), H3_SYN_F16, seed(26), uniform(D), 0.0f, q.wqkv, "qkfix wqkv"));
+      const int32_t split[4] = {0, 48, -1, -1};
+      H3_TRY(backend.upload(split, sizeof split, q.splitDims, "qkfix split"));
+      w->available_.insert(b);
+    }
+  }
+  const int64_t KV = H3_DIT_VIDEO_CHANNELS, KA = H3_DIT_AUDIO_CHANNELS;
+  auto io = [](int id) { return syntheticSeed(kSyntheticIoGroup, id); };
+  DitIoWeights &o = w->io_;
+  H3_TRY(f.allocate(size_t(KV * D), H3_SYN_F32, io(0), uniform(KV), 0.0f, o.videoProj, "video_patch_proj"));
+  H3_TRY(f.allocate(size_t(D), H3_SYN_F32, io(1), 0.1f, 0.0f, o.videoProjBias, "video_patch_proj.bias"));
+  H3_TRY(f.allocate(size_t(KA * D), H3_SYN_F32, io(2), uniform(KA), 0.0f, o.audioProj, "audio_patch_proj"));
+  H3_TRY(f.allocate(size_t(D), H3_SYN_F32, io(3), 0.1f, 0.0f, o.audioProjBias, "audio_patch_proj.bias"));
+  H3_TRY(f.allocate(size_t(D), H3_SYN_BF16, io(4), 0.1f, 1.0f, o.finalNorm, "final norm"));
+  H3_TRY(f.allocate(size_t(KV * D), H3_SYN_F32, io(5), uniform(D), 0.0f, o.videoOut, "video_out"));
+  H3_TRY(f.allocate(size_t(KV), H3_SYN_F32, io(6), 0.1f, 0.0f, o.videoOutBias, "video_out.bias"));
+  H3_TRY(f.allocate(size_t(KA * D), H3_SYN_F32, io(7), uniform(D), 0.0f, o.audioOut, "audio_out"));
+  H3_TRY(f.allocate(size_t(KA), H3_SYN_F32, io(8), 0.1f, 0.0f, o.audioOutBias, "audio_out.bias"));
+  w->residentBytes_ = f.bytes();
+  H3_TRY(f.run());
+  out = std::move(w);
   return {};
 }
 

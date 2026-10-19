@@ -239,32 +239,40 @@ class VideoServerTests(unittest.TestCase):
 
 
 FAKE_VIDEO_NATIVE = """#!{python}
-import json, sys, time
+import json, sys
 out = sys.argv[5]
-phases = sys.argv[sys.argv.index("--phases") + 1].split(",")
+outputs = sys.argv[sys.argv.index("--outputs") + 1].split(",")
+assert sys.argv[4].endswith("prompt.npz") and "--frames" in sys.argv and "--seed" in sys.argv
 def emit(**event):
     event.update(footprint_bytes=1, peak_footprint_bytes=5 << 30)
     print(json.dumps(event), flush=True)
-emit(event="ready", frames=73, width=1344, height=768, text_rows=32)
+def phase(name, **fields):
+    emit(event="phase", phase=name, state="started")
+    emit(event="phase", phase=name, state="completed", seconds=0.1, **fields)
+emit(event="ready", frames=73, width=1344, height=768)
+phase("prep", text_rows=32, steps=8)
 emit(event="phase", phase="denoise", state="started")
 for step in range(1, 9):
     emit(event="step", phase="denoise", step=step, steps=8, wall_ms=1.0, device_mb=1.0)
 emit(event="phase", phase="denoise", state="completed", seconds=0.1, steps=8)
-if "preview" in phases:
-    open(out + "/preview.yuv", "wb").write(b"\\0" * 16)
-    emit(event="phase", phase="preview", state="completed", seconds=0.1, frames=73)
+if "preview" in outputs:
+    open(out + "/preview.mp4", "wb").write(b"p")
+    phase("preview", frames=73)
 if "{fail}" == "yes":
     emit(event="error", message="the video VAE produced non-finite values")
     sys.exit(1)
-open(out + "/frames.rgb", "wb").write(b"\\0" * 16)
-emit(event="phase", phase="decode", state="completed", seconds=0.1, frames=73)
+phase("decode", frames=73)
+if "audio" in outputs:
+    phase("audio", samples=97600)
+open(out + "/video.mp4", "wb").write(b"v")
+phase("mux")
 emit(event="done")
 """
 
 
 class H3PipelineTests(unittest.TestCase):
-    """The GPU phases' events as the pipeline reads them, with a stand-in
-    for `splash video-native`."""
+    """video-native's events as the pipeline reads them, with a stand-in for
+    `splash video-native`."""
 
     def pipeline(self, directory, fail=False):
         binary = Path(directory) / "video-native"
@@ -284,17 +292,13 @@ class H3PipelineTests(unittest.TestCase):
             "transformers.AutoTokenizer.from_pretrained", return_value=None
         ):
             pipeline = videos.H3Pipeline(
-                installation, None, None, binary=sys.executable, metallib="unused"
+                installation, None, None, binary=binary, metallib="unused"
             )
-        pipeline.binary = str(binary)
         return pipeline
 
     def run_generate(self, fail=False, preview=True):
         with tempfile.TemporaryDirectory() as directory:
             pipeline = self.pipeline(directory, fail)
-            pipeline._encode_preview = lambda job, out: (
-                out / "preview.mp4"
-            ).write_bytes(b"p")
             job = videos.VideoJob(
                 "video_1",
                 MODEL,
@@ -315,12 +319,18 @@ class H3PipelineTests(unittest.TestCase):
     def test_steps_advance_progress_and_the_preview_is_published_early(self):
         reports, error = self.run_generate()
         self.assertIsNone(error)
-        progress = [r["progress"] for r in reports if "progress" in r]
+        progress = [r["progress"] for r in reports if r.get("progress") is not None]
         self.assertEqual(progress, sorted(progress))
-        self.assertEqual(progress[-1], videos.PHASE_PROGRESS["decode"])
+        self.assertEqual(progress[-1], 100)
         names = [r["timing"][0] for r in reports if "timing" in r]
-        self.assertEqual(names, ["denoise", "preview", "decode", "video_native"])
-        self.assertIn({"preview": True}, reports)
+        self.assertEqual(
+            names,
+            ["prep", "denoise", "preview", "decode", "audio", "mux", "video_native"],
+        )
+        self.assertLess(
+            reports.index({"preview": True}),
+            next(i for i, r in enumerate(reports) if r.get("phase") == "decode"),
+        )
         native = next(
             r["timing"][1]
             for r in reports

@@ -2,19 +2,23 @@
 
 """The vendored video engine against its references (make test-video-real).
 
-Runs `splash video-native` on a request's saved prepared inputs, the 3 s
-golden request of the h3 engine's own suite, with the installed weights:
-resident, then streamed from SSD with 8 block slots. Both runs' final
-latents, the W8 video VAE frames and the TAEH3 preview frames must equal the
-references byte for byte (runtime/video/VENDORED), as h3's smoke, VAE and
-preview checks require. A cancelled run must exit at a step boundary with
-its own status. Each run's wall time and peak footprint go to --output.
+Runs `splash video-native` on the 3 s golden request of the h3 engine's own
+suite with the installed weights: from its saved prepared inputs with
+resident weights, then from its prompt's hidden states, prepared by the
+engine, with the weights streamed from SSD through 8 block slots. The final
+latents of both, the prepared inputs, the W8 video VAE frames and the TAEH3
+preview frames must equal the references byte for byte
+(runtime/video/VENDORED), as h3's prep, smoke, VAE and preview checks
+require; the video and preview mp4s must be written. A cancelled run must
+exit at a step boundary with its own status. Each run's phases, wall time and
+peak footprint go to --output.
 
   dev/tests/video_engine_real.py --weights VIDEO_ROOT/weights \\
       --references DIR --output build/release/video-engine.json
 
-DIR holds prep/ (layout.npz, text_ref.npy, ada_blocks.npy, ada_final.npy,
-sched.npz, noise.npz), final.npz, frames.npy and preview_frames.npy.
+DIR holds prompt.npz (the hidden states), prep/ (layout.npz, text_ref.npy,
+ada_blocks.npy, ada_final.npy, sched.npz, noise.npz), final.npz, frames.npy
+and preview_frames.npy.
 """
 
 from __future__ import annotations
@@ -34,13 +38,13 @@ ROOT = Path(__file__).resolve().parents[2]
 CANCELLED = 75
 
 
-def run(binary, metallib, weights, prep, out, *options):
+def run(binary, metallib, weights, source, out, *options):
     command = [
         str(binary),
         "video-native",
         str(weights),
         str(metallib),
-        str(prep),
+        str(source),
         str(out),
         *options,
     ]
@@ -79,7 +83,7 @@ def cancelled_run(binary, metallib, weights, prep, out):
     after and exits with the cancelled status."""
     process = subprocess.Popen(
         [str(binary), "video-native", str(weights), str(metallib), str(prep), str(out),
-         "--phases", "denoise"],
+         "--outputs", "latents"],
         stdout=subprocess.PIPE,
         stderr=subprocess.DEVNULL,
         text=True,
@@ -112,25 +116,36 @@ def main():
     with tempfile.TemporaryDirectory(
         prefix="splash-video-engine-", dir=ROOT / "build"
     ) as directory:
-        for label, options in (
-            ("resident", ["--phases", "denoise,preview,decode", "--preview-rgb"]),
-            ("streamed", ["--phases", "denoise", "--stream", "--stream-slots", "8"]),
-        ):
-            out = Path(directory) / label
+        runs = (
+            ("saved prep, resident", prep, ["--outputs", "preview,video,audio", "--frames-rgb", "--preview-rgb"]),
+            ("engine prep, streamed", references / "prompt.npz",
+             ["--outputs", "latents", "--save-prep", "--stream", "--stream-slots", "8"]),
+        )  # fmt: skip
+        for label, source, options in runs:
+            out = Path(directory) / label.replace(", ", "-").replace(" ", "-")
             report[label] = run(
                 arguments.binary,
                 arguments.metallib,
                 arguments.weights,
-                prep,
+                source,
                 out,
                 *options,
             )
             checks = {"final.npz": references / "final.npz"}
-            if label == "resident":
+            if "--frames-rgb" in options:
                 checks |= {
                     "frames.rgb": references / "frames.npy",
                     "preview.rgb": references / "preview_frames.npy",
                 }
+                for name in ("video.mp4", "preview.mp4"):
+                    if (out / name).read_bytes()[4:8] != b"ftyp":
+                        raise AssertionError(f"{label}: {name} is not an mp4")
+            if "--save-prep" in options:
+                checks |= {
+                    f"prep/{name}": prep / name
+                    for name in ("layout.npz", "text_ref.npy", "ada_blocks.npy", "ada_final.npy",
+                                 "sched.npz", "noise.npz")
+                }  # fmt: skip
             for name, reference in checks.items():
                 same = identical(out / name, reference)
                 report[label][f"{name} identical"] = same

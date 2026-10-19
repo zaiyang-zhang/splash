@@ -40,6 +40,12 @@ struct DecodeStats {
   double deviceMb = 0;
 };
 
+struct AudioStats {
+  double wallS = 0, gpuS = 0;
+  int64_t samples = 0, nonfinite = 0;  // per channel; non-finite values in the waveform
+  double deviceMb = 0;
+};
+
 struct PreviewStats {
   double wallS = 0, gpuS = 0, hostCopyS = 0;
   int64_t nonfinite = 0;

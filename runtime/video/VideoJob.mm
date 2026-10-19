@@ -85,13 +85,28 @@ std::string number(double value) {
   return text;
 }
 
+void phaseStarted(std::string_view phase) {
+  emit("phase", member("phase", quoted(phase)) + ", " + member("state", quoted("started")));
+}
+
+void phaseCompleted(std::string_view phase, std::chrono::steady_clock::time_point started,
+                    const std::string &fields = {}) {
+  const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
+  emit("phase", member("phase", quoted(phase)) + ", " + member("state", quoted("completed")) + ", " +
+                    member("seconds", number(seconds)) + (fields.empty() ? "" : ", " + fields));
+}
+
 struct Options {
-  std::filesystem::path weights, metallib, prep, out;
+  std::filesystem::path weights, metallib, input, out;
   h3_request request = h3_default_request();
-  bool denoise = true, preview = false, decode = true;
-  // Also write the preview's RGB frames, preview.rgb (dev/tests).
-  bool previewRgb = false;
+  // The input is a saved prep directory instead of a prompt embedding.
+  bool savedPrep = false;
+  bool preview = false, video = true, audio = true;
+  uint64_t seed = 0;
   int32_t steps = 0;
+  // Development outputs: the raw preview and video frames (preview.rgb,
+  // frames.rgb) and the prepared inputs (prep/).
+  bool previewRgb = false, framesRgb = false, savePrep = false;
 };
 
 int32_t parseCount(std::string_view option, std::string_view value) {
@@ -108,12 +123,13 @@ int32_t parseCount(std::string_view option, std::string_view value) {
 
 Options parse(int argc, char **argv) {
   if (argc < 6)
-    throw JobError("usage: splash video-native WEIGHTS_ROOT METALLIB PREP_DIR OUT_DIR [options]");
+    throw JobError("usage: splash video-native WEIGHTS_ROOT METALLIB INPUT OUT_DIR [options]");
   Options o;
   o.weights = argv[2];
   o.metallib = argv[3];
-  o.prep = argv[4];
+  o.input = argv[4];
   o.out = argv[5];
+  o.savedPrep = std::filesystem::is_directory(o.input);
   for (int i = 6; i < argc; ++i) {
     const std::string_view option(argv[i]);
     if (option == "--no-qkfix") {
@@ -124,8 +140,8 @@ Options parse(int argc, char **argv) {
       o.request.stream = 1;
       continue;
     }
-    if (option == "--preview-rgb") {
-      o.previewRgb = true;
+    if (option == "--preview-rgb" || option == "--frames-rgb" || option == "--save-prep") {
+      (option == "--preview-rgb" ? o.previewRgb : option == "--frames-rgb" ? o.framesRgb : o.savePrep) = true;
       continue;
     }
     if (i + 1 >= argc) throw JobError(std::string(option) + " requires a value");
@@ -133,6 +149,10 @@ Options parse(int argc, char **argv) {
     if (option == "--variant") {
       if (value != "turbo" && value != "default") throw JobError("--variant requires turbo or default");
       o.request.variant = value == "turbo" ? H3_VARIANT_TURBO : H3_VARIANT_DEFAULT;
+    } else if (option == "--frames") {
+      o.request.frames = parseCount(option, value);
+    } else if (option == "--seed") {
+      o.seed = static_cast<uint64_t>(parseCount(option, value));
     } else if (option == "--chunk") {
       o.request.window_chunk = parseCount(option, value);
     } else if (option == "--radius") {
@@ -150,14 +170,14 @@ Options parse(int argc, char **argv) {
     } else if (option == "--vae-precision") {
       if (value != "w8" && value != "f16") throw JobError("--vae-precision requires w8 or f16");
       o.request.vae_precision = value == "w8" ? H3_VAE_W8 : H3_VAE_F16;
-    } else if (option == "--phases") {
-      o.denoise = o.preview = o.decode = false;
-      std::stringstream phases{std::string(value)};
-      for (std::string phase; std::getline(phases, phase, ',');) {
-        if (phase == "denoise") o.denoise = true;
-        else if (phase == "preview") o.preview = true;
-        else if (phase == "decode") o.decode = true;
-        else throw JobError("--phases takes denoise, preview and decode");
+    } else if (option == "--outputs") {
+      o.preview = o.video = o.audio = false;
+      std::stringstream outputs{std::string(value)};
+      for (std::string output; std::getline(outputs, output, ',');) {
+        if (output == "preview") o.preview = true;
+        else if (output == "video") o.video = true;
+        else if (output == "audio") o.audio = true;
+        else if (!output.empty() && output != "latents") throw JobError("--outputs takes latents, preview, video and audio");
       }
     } else if (option == "--steps") {
       o.steps = parseCount(option, value);
@@ -210,59 +230,95 @@ void cancelPoint(std::string_view phase, int32_t step = -1) {
   _exit(kVideoCancelledExit);
 }
 
-struct Prepared {
+// The DiT's inputs: the engine's own prep (h3_prep) of a prompt embedding,
+// or a saved prep directory's arrays.
+struct DitInputs {
+  h3_dit_inputs dit{};
+  h3_schedule schedule{};
+  const float *videoNoise = nullptr, *audioNoise = nullptr;
+  // A saved prep's arrays, which the pointers above borrow.
   std::map<std::string, h3::model::NpyArray> layout, sched, noise;
   h3::model::NpyArray text, adaBlocks, adaFinal;
-  int32_t frames = 0, textRows = 0;
+  std::vector<float> videoT, audioT, videoSigmas, audioSigmas;
 };
 
-Prepared readLayout(const std::filesystem::path &prep) {
-  Prepared p;
-  check(h3::model::readNpz((prep / "layout.npz").string(), p.layout));
-  int64_t frames = 0, text = 0;
-  check(p.layout.at("frames").toInt64(frames));
-  check(p.layout.at("L").toInt64(text));
-  p.frames = static_cast<int32_t>(frames);
-  p.textRows = static_cast<int32_t>(text);
-  return p;
+int32_t savedFrames(const std::filesystem::path &prep) {
+  std::map<std::string, h3::model::NpyArray> layout;
+  check(h3::model::readNpz((prep / "layout.npz").string(), layout));
+  int64_t frames = 0;
+  check(layout.at("frames").toInt64(frames));
+  return static_cast<int32_t>(frames);
 }
 
-void denoise(const Options &o, Engine &engine, Prepared &p, const h3_geometry &g) {
-  const auto started = std::chrono::steady_clock::now();
-  emit("phase", member("phase", quoted("denoise")) + ", " + member("state", quoted("started")));
-  const size_t rows = p.layout.at("tags").count();
+void readSaved(const Options &o, const h3_geometry &g, DitInputs &in) {
+  const std::filesystem::path &prep = o.input;
+  check(h3::model::readNpz((prep / "layout.npz").string(), in.layout));
+  int64_t textRows = 0;
+  check(in.layout.at("L").toInt64(textRows));
+  const size_t rows = in.layout.at("tags").count();
   const h3::model::NpyArray *tags = nullptr, *rope = nullptr;
-  check(h3::model::member(p.layout, "tags", "|u1", 0, tags));
-  check(h3::model::member(p.layout, "rope", "<u2", rows * 96, rope));
-  check(h3::model::readNpy((o.prep / "text_ref.npy").string(), p.text));
-  if (p.text.dtype != "<u2" || p.text.count() != size_t(p.textRows) * 5376)
+  check(h3::model::member(in.layout, "tags", "|u1", 0, tags));
+  check(h3::model::member(in.layout, "rope", "<u2", rows * 96, rope));
+  check(h3::model::readNpy((prep / "text_ref.npy").string(), in.text));
+  if (in.text.dtype != "<u2" || in.text.count() != size_t(textRows) * 5376)
     throw JobError("text_ref.npy: expected bf16 [L][5376]");
-  const h3_dit_inputs inputs{p.textRows, tags->as<uint8_t>(), rope->as<uint16_t>(), p.text.as<uint16_t>()};
-  engine.call(h3_dit_load(engine.get(), &inputs), "load the DiT");
-  check(h3::model::readNpy((o.prep / "ada_blocks.npy").string(), p.adaBlocks));
-  check(h3::model::readNpy((o.prep / "ada_final.npy").string(), p.adaFinal));
-  check(h3::model::readNpz((o.prep / "sched.npz").string(), p.sched));
-  check(h3::model::readNpz((o.prep / "noise.npz").string(), p.noise));
-  std::vector<float> videoT, audioT, videoSigmas, audioSigmas;
-  check(p.sched.at("v_t").toFloat32(videoT));
-  check(p.sched.at("a_t").toFloat32(audioT));
-  check(p.sched.at("v_sigmas").toFloat32(videoSigmas));
-  check(p.sched.at("a_sigmas").toFloat32(audioSigmas));
-  int32_t steps = static_cast<int32_t>(videoT.size());
+  in.dit = {static_cast<int32_t>(textRows), tags->as<uint8_t>(), rope->as<uint16_t>(), in.text.as<uint16_t>()};
+  check(h3::model::readNpy((prep / "ada_blocks.npy").string(), in.adaBlocks));
+  check(h3::model::readNpy((prep / "ada_final.npy").string(), in.adaFinal));
+  check(h3::model::readNpz((prep / "sched.npz").string(), in.sched));
+  check(h3::model::readNpz((prep / "noise.npz").string(), in.noise));
+  check(in.sched.at("v_t").toFloat32(in.videoT));
+  check(in.sched.at("a_t").toFloat32(in.audioT));
+  check(in.sched.at("v_sigmas").toFloat32(in.videoSigmas));
+  check(in.sched.at("a_sigmas").toFloat32(in.audioSigmas));
+  const h3::model::NpyArray *video = nullptr, *audio = nullptr;
+  check(h3::model::member(in.noise, "video", "<f4", size_t(g.video_rows) * 96, video));
+  check(h3::model::member(in.noise, "audio", "<f4", size_t(g.audio_rows) * 32, audio));
+  in.videoNoise = video->as<float>();
+  in.audioNoise = audio->as<float>();
+  int32_t steps = static_cast<int32_t>(in.videoT.size());
   if (o.steps) steps = std::min(steps, o.steps);
-  const h3::model::NpyArray *videoNoise = nullptr, *audioNoise = nullptr;
-  check(h3::model::member(p.noise, "video", "<f4", size_t(g.video_rows) * 96, videoNoise));
-  check(h3::model::member(p.noise, "audio", "<f4", size_t(g.audio_rows) * 32, audioNoise));
-  if (p.adaBlocks.dtype != "<u2" || p.adaBlocks.shape.empty() || p.adaBlocks.shape[0] < steps ||
-      p.adaFinal.shape.empty() || p.adaFinal.shape[0] < steps)
+  if (in.adaBlocks.dtype != "<u2" || in.adaBlocks.shape.empty() || in.adaBlocks.shape[0] < steps ||
+      in.adaFinal.shape.empty() || in.adaFinal.shape[0] < steps)
     throw JobError("the adaLN tables do not cover the schedule's steps");
-  const h3_schedule schedule{steps,          p.adaBlocks.as<uint16_t>(), p.adaFinal.as<uint16_t>(),
-                             videoT.data(),  audioT.data(),              videoSigmas.data(),
-                             audioSigmas.data()};
-  std::vector<float> video(videoNoise->count()), audio(audioNoise->count());
+  in.schedule = {steps,          in.adaBlocks.as<uint16_t>(), in.adaFinal.as<uint16_t>(),
+                 in.videoT.data(), in.audioT.data(),           in.videoSigmas.data(),
+                 in.audioSigmas.data()};
+}
+
+void prepare(const Options &o, Engine &engine, DitInputs &in) {
+  const auto started = std::chrono::steady_clock::now();
+  phaseStarted("prep");
+  std::map<std::string, h3::model::NpyArray> embedding;
+  check(h3::model::readNpz(o.input.string(), embedding));
+  if (!embedding.count("hidden")) throw JobError(o.input.string() + ": no member hidden");
+  const h3::model::NpyArray &hidden = embedding.at("hidden");
+  if (hidden.dtype != "<f4" || hidden.shape.size() != 2 || hidden.shape[1] != 5120)
+    throw JobError(o.input.string() + ": hidden states must be f4 [L][5120]");
+  const h3_prep_inputs inputs{hidden.as<float>(), static_cast<int32_t>(hidden.shape[0]), o.steps, o.seed};
+  h3_prepared p{};
+  engine.call(h3_prep(engine.get(), &inputs, &p), "prepare the request");
+  if (o.savePrep) engine.call(h3_prep_write(engine.get(), (o.out / "prep").c_str()), "write the prep");
+  in.dit = {p.text_rows, p.tags, p.rope, p.text};
+  in.schedule = {p.steps, p.ada_blocks, p.ada_final, p.video_t, p.audio_t, p.video_sigmas, p.audio_sigmas};
+  in.videoNoise = p.video_noise;
+  in.audioNoise = p.audio_noise;
+  phaseCompleted("prep", started,
+                 member("text_rows", std::to_string(p.text_rows)) + ", " + member("steps", std::to_string(p.steps)));
+}
+
+struct Latents {
+  std::vector<float> video, audio;
+};
+
+Latents denoise(const Options &o, Engine &engine, DitInputs &in, const h3_geometry &g) {
+  const auto started = std::chrono::steady_clock::now();
+  phaseStarted("denoise");
+  engine.call(h3_dit_load(engine.get(), &in.dit), "load the DiT");
+  Latents latents{std::vector<float>(size_t(g.video_rows) * 96), std::vector<float>(size_t(g.audio_rows) * 32)};
   struct Progress {
     int32_t steps;
-  } progress{steps};
+  } progress{in.schedule.steps};
   const h3_step_callback onStep = [](void *user, int32_t step, const h3_forward_stats *stats, const float *,
                                      const float *) {
     const auto *state = static_cast<const Progress *>(user);
@@ -272,91 +328,109 @@ void denoise(const Options &o, Engine &engine, Prepared &p, const h3_geometry &g
                      member("device_mb", number(stats->device_mb)));
     cancelPoint("denoise", step + 1);
   };
-  engine.call(h3_denoise(engine.get(), &schedule, videoNoise->as<float>(), audioNoise->as<float>(), video.data(),
-                         audio.data(), onStep, &progress),
+  engine.call(h3_denoise(engine.get(), &in.schedule, in.videoNoise, in.audioNoise, latents.video.data(),
+                         latents.audio.data(), onStep, &progress),
               "denoise");
-  const auto v = h3::model::NpyArray::of("<f4", {g.video_rows, 96}, video.data(), video.size() * 4);
-  const auto a = h3::model::NpyArray::of("<f4", {g.audio_rows, 32}, audio.data(), audio.size() * 4);
+  const auto v = h3::model::NpyArray::of("<f4", {g.video_rows, 96}, latents.video.data(), latents.video.size() * 4);
+  const auto a = h3::model::NpyArray::of("<f4", {g.audio_rows, 32}, latents.audio.data(), latents.audio.size() * 4);
   check(h3::model::writeNpz((o.out / "final.npz").string(), {{"video", &v}, {"audio", &a}}));
   h3_dit_release(engine.get());
-  p.adaBlocks = {};
-  p.adaFinal = {};
-  p.text = {};
-  const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
-  emit("phase", member("phase", quoted("denoise")) + ", " + member("state", quoted("completed")) + ", " +
-                    member("seconds", number(seconds)) + ", " + member("steps", std::to_string(steps)));
+  if (!o.savedPrep) h3_prep_release(engine.get());
+  phaseCompleted("denoise", started, member("steps", std::to_string(in.schedule.steps)));
+  return latents;
 }
 
-std::vector<float> finalVideoLatents(const Options &o, const h3_geometry &g) {
-  std::map<std::string, h3::model::NpyArray> latents;
-  check(h3::model::readNpz((o.out / "final.npz").string(), latents));
-  const h3::model::NpyArray *video = nullptr;
-  check(h3::model::member(latents, "video", "<f4", size_t(g.video_rows) * 96, video));
-  return {video->as<float>(), video->as<float>() + video->count()};
+void writeMp4(const std::filesystem::path &path, const std::vector<uint8_t> &frames, int32_t count,
+              const h3_geometry &g, const std::vector<float> &wav) {
+  const std::filesystem::path staging = path.string() + ".partial.mp4";
+  h3_mp4_stats stats{};
+  if (h3_write_mp4(staging.c_str(), frames.data(), count, g.width, g.height, wav.empty() ? nullptr : wav.data(),
+                   wav.empty() ? 0 : g.audio_samples, &stats) != H3_OK)
+    throw JobError("cannot write " + path.string());
+  std::filesystem::rename(staging, path);
 }
 
-void preview(const Options &o, Engine &engine, const h3_geometry &g, const std::vector<float> &latents) {
+void preview(const Options &o, Engine &engine, const h3_geometry &g, const Latents &latents) {
   const auto started = std::chrono::steady_clock::now();
-  emit("phase", member("phase", quoted("preview")) + ", " + member("state", quoted("started")));
-  const size_t frameBytes = size_t(g.width) * g.height * 3;
-  std::vector<uint8_t> frames(frameBytes * g.preview_frames), yuv(frameBytes / 2 * g.preview_frames);
+  phaseStarted("preview");
+  std::vector<uint8_t> frames(size_t(g.width) * g.height * 3 * g.preview_frames);
   h3_preview_stats stats{};
-  engine.call(h3_preview(engine.get(), latents.data(), frames.data(), yuv.data(), &stats), "preview");
+  engine.call(h3_preview(engine.get(), latents.video.data(), frames.data(), nullptr, &stats), "preview");
   if (stats.nonfinite) throw JobError("the preview decoder produced non-finite values");
-  writeFile(o.out / "preview.yuv", yuv.data(), yuv.size());
   if (o.previewRgb) writeFile(o.out / "preview.rgb", frames.data(), frames.size());
-  const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
-  emit("phase", member("phase", quoted("preview")) + ", " + member("state", quoted("completed")) + ", " +
-                    member("seconds", number(seconds)) + ", " +
-                    member("frames", std::to_string(g.preview_frames)));
+  writeMp4(o.out / "preview.mp4", frames, g.preview_frames, g, {});
+  phaseCompleted("preview", started, member("frames", std::to_string(g.preview_frames)));
 }
 
-void decode(const Options &o, Engine &engine, const h3_geometry &g, const std::vector<float> &latents) {
+std::vector<uint8_t> decode(const Options &o, Engine &engine, const h3_geometry &g, const Latents &latents) {
   const auto started = std::chrono::steady_clock::now();
-  emit("phase", member("phase", quoted("decode")) + ", " + member("state", quoted("started")));
+  phaseStarted("decode");
   std::vector<uint8_t> frames(size_t(g.width) * g.height * 3 * g.decode_frames);
   h3_decode_stats stats{};
-  engine.call(h3_decode(engine.get(), latents.data(), frames.data(), &stats), "decode");
+  engine.call(h3_decode(engine.get(), latents.video.data(), frames.data(), &stats), "decode");
   if (stats.nonfinite) throw JobError("the video VAE produced non-finite values");
-  writeFile(o.out / "frames.rgb", frames.data(), frames.size());
-  const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
-  emit("phase", member("phase", quoted("decode")) + ", " + member("state", quoted("completed")) + ", " +
-                    member("seconds", number(seconds)) + ", " +
-                    member("frames", std::to_string(g.decode_frames)) + ", " +
-                    member("device_mb", number(stats.device_mb)));
+  if (o.framesRgb) writeFile(o.out / "frames.rgb", frames.data(), frames.size());
+  phaseCompleted("decode", started,
+                 member("frames", std::to_string(g.decode_frames)) + ", " + member("device_mb", number(stats.device_mb)));
+  return frames;
+}
+
+std::vector<float> decodeAudio(Engine &engine, const h3_geometry &g, const Latents &latents) {
+  const auto started = std::chrono::steady_clock::now();
+  phaseStarted("audio");
+  std::vector<float> wav(size_t(2) * g.audio_samples);
+  h3_audio_stats stats{};
+  engine.call(h3_decode_audio(engine.get(), latents.audio.data(), wav.data(), &stats), "decode the audio");
+  if (stats.nonfinite) throw JobError("the audio VAE produced non-finite values");
+  phaseCompleted("audio", started, member("samples", std::to_string(stats.samples)));
+  return wav;
 }
 
 void run(const Options &options) {
   Options o = options;
-  Prepared p = readLayout(o.prep);
-  o.request.frames = p.frames;
+  if (o.savedPrep) o.request.frames = savedFrames(o.input);
   h3_geometry g{};
   if (h3_geometry_of(&o.request, &g) != H3_OK) throw JobError("the request's clip geometry is invalid");
   std::filesystem::create_directories(o.out);
   emit("ready", member("frames", std::to_string(g.frames)) + ", " + member("width", std::to_string(g.width)) +
-                    ", " + member("height", std::to_string(g.height)) + ", " +
-                    member("text_rows", std::to_string(p.textRows)));
+                    ", " + member("height", std::to_string(g.height)));
   Engine engine(o);
+  Latents latents;
   // Each phase drains its own pool: the Metal objects a phase autoreleases,
   // the DiT's buffers among them, are freed before the next phase allocates.
-  if (o.denoise) {
-    @autoreleasepool {
-      denoise(o, engine, p, g);
-    }
+  @autoreleasepool {
+    DitInputs inputs;
+    if (o.savedPrep) readSaved(o, g, inputs);
+    else prepare(o, engine, inputs);
+    cancelPoint("prep");
+    latents = denoise(o, engine, inputs, g);
   }
   cancelPoint("denoise");
-  if (!o.preview && !o.decode) return;
-  const std::vector<float> latents = finalVideoLatents(o, g);
   if (o.preview) {
     @autoreleasepool {
       preview(o, engine, g, latents);
     }
+    cancelPoint("preview");
   }
-  cancelPoint("preview");
-  if (o.decode) {
+  std::vector<uint8_t> frames;
+  if (o.video || o.framesRgb) {
     @autoreleasepool {
-      decode(o, engine, g, latents);
+      frames = decode(o, engine, g, latents);
     }
+    cancelPoint("decode");
+  }
+  std::vector<float> wav;
+  if (o.audio) {
+    @autoreleasepool {
+      wav = decodeAudio(engine, g, latents);
+    }
+    cancelPoint("audio");
+  }
+  if (o.video) {
+    const auto started = std::chrono::steady_clock::now();
+    phaseStarted("mux");
+    writeMp4(o.out / "video.mp4", frames, g.decode_frames, g, wav);
+    phaseCompleted("mux", started);
   }
 }
 

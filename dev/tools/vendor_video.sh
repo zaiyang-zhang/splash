@@ -45,4 +45,9 @@ sed -i '' -E $rewrite \
   -e 's#"metal/kernels/common/#"metal/kernels/video/common/#g' \
   -e 's#"h3/h3.h"#"video/abi/h3.h"#g' \
   $files
-echo "vendored h3 $(git -C $SRC rev-parse HEAD) (host directories: $hosts)"
+# Local patch (runtime/video/VENDORED): a slot's free semaphore starts at 0 and
+# is signalled once, so disposing it while the SSD reader holds the slot does
+# not trap in libdispatch.
+sed -i '' -E 's#^( *)slot\.free = dispatch_semaphore_create\(1\);#\1slot.free = dispatch_semaphore_create(0);\
+\1dispatch_semaphore_signal(slot.free);#' runtime/video/engine/WeightStream.mm
+echo "vendored h3 $(git -C $SRC rev-parse HEAD 2>/dev/null || echo "(not a git checkout)") (host directories: $hosts)"
