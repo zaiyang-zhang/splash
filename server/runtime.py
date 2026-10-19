@@ -441,6 +441,16 @@ class _StatusWaiter:
 
 
 @dataclass(slots=True)
+class _VideoWaiter:
+    """A hidden-states request or an exclusive handoff waiting for its event."""
+
+    generation: int
+    event: threading.Event = field(default_factory=threading.Event)
+    result: wire.HiddenStatesEvent | wire.ExclusiveDoneEvent | None = None
+    error: EngineRuntimeError | None = None
+
+
+@dataclass(slots=True)
 class _StartupAttempt:
     deadline: float
     event: threading.Event = field(default_factory=threading.Event)
@@ -507,6 +517,11 @@ class MultiplexedRuntime:
         self._terminal_error: EngineRuntimeError | None = None
         self._pending: dict[int, RuntimeCall] = {}
         self._status_waiters: dict[int, _StatusWaiter] = {}
+        # Hidden-states requests by request id, exclusive handoffs by
+        # correlation id; both answered on the reader thread.
+        self._hidden_waiters: dict[int, _VideoWaiter] = {}
+        self._exclusive_waiters: dict[int, _VideoWaiter] = {}
+        self._exclusive_ids = itertools.count(1)
         self._last_status_id = 0
         self._last_status: wire.StatusJsonEvent | None = None
         self._request_ids = itertools.count(1)
@@ -692,6 +707,62 @@ class MultiplexedRuntime:
             raise waiter.error.restate()
         assert waiter.result is not None
         return waiter.result
+
+    def _video_call(
+        self,
+        waiters: dict[int, _VideoWaiter],
+        key: int,
+        frame: wire.Message,
+        timeout: float,
+    ):
+        if not math.isfinite(timeout) or timeout <= 0:
+            raise ValueError("timeout must be positive")
+        deadline = time.monotonic() + timeout
+        try:
+            encoded = wire.serialize_message(frame)
+        except wire.ProtocolError as error:
+            raise self._request_protocol_error(key, error.issue) from error
+        with self._state_lock:
+            if self._closed:
+                raise RuntimeClosed("runtime is closed")
+            generation = self._generation
+            self._require_generation_ready_locked(generation)
+            waiter = _VideoWaiter(generation)
+            waiters[key] = waiter
+        try:
+            self._write_bytes(encoded, generation, deadline=deadline)
+        except BaseException:
+            with self._state_lock:
+                waiters.pop(key, None)
+            raise
+        if not waiter.event.wait(max(0.0, deadline - time.monotonic())):
+            with self._state_lock:
+                if waiters.pop(key, None) is waiter:
+                    raise TimeoutError("native video response timed out")
+        if waiter.error:
+            raise waiter.error.restate()
+        assert waiter.result is not None
+        return waiter.result
+
+    def hidden_states(
+        self, prompt_tokens: tuple[int, ...], layer: int, timeout: float = 600.0
+    ) -> wire.HiddenStatesEvent:
+        """The video model's text encoder on one prompt: f32 hidden states
+        after ``layer`` decoder layers. Fails with RequestFailed (for example
+        ``engine_busy`` while generation runs, ``insufficient_memory``)."""
+
+        request_id = next(self._request_ids)
+        frame = wire.HiddenStatesRequestFrame(request_id, layer, tuple(prompt_tokens))
+        return self._video_call(self._hidden_waiters, request_id, frame, timeout)
+
+    def exclusive(
+        self, acquire: bool, timeout: float = 120.0
+    ) -> wire.ExclusiveDoneEvent:
+        """Hand the GPU to a video job (acquire) or take it back."""
+
+        correlation_id = next(self._exclusive_ids)
+        frame = wire.ExclusiveFrame(correlation_id, acquire)
+        return self._video_call(self._exclusive_waiters, correlation_id, frame, timeout)
 
     def close(self) -> None:
         with self._state_lock:
@@ -1134,6 +1205,16 @@ class MultiplexedRuntime:
         if isinstance(message, wire.StatusJsonEvent):
             self._dispatch_status(generation, message)
             return
+        if isinstance(message, wire.HiddenStatesEvent):
+            self._dispatch_video(
+                self._hidden_waiters, message.request_id, generation, message
+            )
+            return
+        if isinstance(message, wire.ExclusiveDoneEvent):
+            self._dispatch_video(
+                self._exclusive_waiters, message.correlation_id, generation, message
+            )
+            return
         if isinstance(message, wire.ErrorEvent):
             self._dispatch_error(generation, message)
             return
@@ -1184,8 +1265,34 @@ class MultiplexedRuntime:
                 )
             return call
 
+    def _dispatch_video(
+        self,
+        waiters: dict[int, _VideoWaiter],
+        key: int,
+        generation: int,
+        event: wire.HiddenStatesEvent | wire.ExclusiveDoneEvent,
+    ) -> None:
+        with self._state_lock:
+            waiter = waiters.pop(key, None)
+        # A waiter that timed out is gone; its late answer is dropped.
+        if waiter is None or waiter.generation != generation:
+            return
+        waiter.result = event
+        waiter.event.set()
+
     def _dispatch_error(self, generation: int, event: wire.ErrorEvent) -> None:
         if event.failure_class is wire.FailureClass.REQUEST_ERROR:
+            with self._state_lock:
+                waiter = self._hidden_waiters.pop(event.request_id, None)
+            if waiter is not None:
+                waiter.error = RequestFailed(
+                    event.request_id,
+                    event.code,
+                    event.message,
+                    retryable=event.retryable,
+                )
+                waiter.event.set()
+                return
             call = self._require_call(generation, event.request_id)
             call._emit(event)
             self._finish_call(
@@ -1329,8 +1436,14 @@ class MultiplexedRuntime:
             process = self._process
             calls = tuple(self._pending.values())
             self._pending.clear()
-            waiters = tuple(self._status_waiters.values())
+            waiters = (
+                tuple(self._status_waiters.values())
+                + tuple(self._hidden_waiters.values())
+                + tuple(self._exclusive_waiters.values())
+            )
             self._status_waiters.clear()
+            self._hidden_waiters.clear()
+            self._exclusive_waiters.clear()
             for waiter in waiters:
                 waiter.error = failure
                 waiter.event.set()

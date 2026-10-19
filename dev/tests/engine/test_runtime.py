@@ -1,5 +1,6 @@
 import os
 import select
+import struct
 import subprocess
 import threading
 import time
@@ -1112,6 +1113,49 @@ class RuntimeTests(unittest.TestCase):
         self.assertNotEqual(status.correlation_id, first.correlation_id)
         self.assertEqual(status.json, b'{"schema_version":4,"ready":true}')
         self.assertEqual(runtime.last_status, status)
+        self.assertTrue(runtime.ready)
+
+    def test_hidden_states_and_exclusive_handoff_are_correlated(self):
+        def handler(process, message):
+            if isinstance(message, wire.HiddenStatesRequestFrame):
+                if message.layer != 50:
+                    process.send(
+                        wire.ErrorEvent(
+                            wire.FailureClass.REQUEST_ERROR,
+                            message.request_id,
+                            True,
+                            b"insufficient_memory",
+                            b"the text encoder needs 13499 MiB",
+                        )
+                    )
+                    return
+                rows = len(message.prompt_tokens)
+                values = struct.pack(f"<{rows * 2}f", *range(rows * 2))
+                process.send(
+                    wire.HiddenStatesEvent(message.request_id, rows, 2, 7, values)
+                )
+            elif isinstance(message, wire.ExclusiveFrame):
+                process.send(
+                    wire.ExclusiveDoneEvent(
+                        message.correlation_id, message.acquire, 5, 6, 7
+                    )
+                )
+
+        factory = FakeFactory(handler)
+        runtime = engine_runtime.MultiplexedRuntime(process_factory=factory)
+        self.addCleanup(runtime.close)
+        states = runtime.hidden_states((3, 4, 5), 50, timeout=1.0)
+        self.assertEqual((states.rows, states.width, states.wall_micros), (3, 2, 7))
+        self.assertEqual(struct.unpack("<6f", states.values), (0, 1, 2, 3, 4, 5))
+        with self.assertRaises(engine_runtime.RequestFailed) as caught:
+            runtime.hidden_states((3,), 49, timeout=1.0)
+        self.assertEqual(caught.exception.code, b"insufficient_memory")
+        self.assertTrue(caught.exception.retryable)
+        acquired = runtime.exclusive(True, timeout=1.0)
+        released = runtime.exclusive(False, timeout=1.0)
+        self.assertEqual((acquired.acquired, released.acquired), (True, False))
+        self.assertNotEqual(acquired.correlation_id, released.correlation_id)
+        self.assertEqual(released.footprint_bytes, 7)
         self.assertTrue(runtime.ready)
 
     def test_request_and_capacity_failures_are_scoped(self):

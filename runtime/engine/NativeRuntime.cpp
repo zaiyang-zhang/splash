@@ -194,6 +194,8 @@ void NativeRuntime::announceReady() {
   uint64_t features = protocol::kNativeFeatureBits;
   if (config_.engine.maxImagePatches)
     features |= protocol::FeatureVision;
+  if (config_.video)
+    features |= protocol::FeatureVideo;
   if (!send(protocol::ReadyEvent{config_.engineInstanceId,
                                  model::ExecutionLimits::maximumBatchWidth,
                                  config_.engine.maxContext, features})) {
@@ -224,6 +226,11 @@ bool NativeRuntime::handle(protocol::Message &message) {
           return handleMask(typed);
         } else if constexpr (std::is_same_v<T, protocol::StatusRequestFrame>) {
           return handleStatus(typed);
+        } else if constexpr (std::is_same_v<
+                                 T, protocol::HiddenStatesRequestFrame>) {
+          return handleHiddenStates(typed);
+        } else if constexpr (std::is_same_v<T, protocol::ExclusiveFrame>) {
+          return handleExclusive(typed);
         } else {
           protocol::ProtocolIssue issue;
           issue.failureClass = protocol::FailureClass::ProtocolFatal;
@@ -244,6 +251,11 @@ bool NativeRuntime::handleRequest(protocol::RequestFrame &request) {
   if (!ready_) {
     requestError(request.requestId, "engine_not_ready",
                  "engine warmup has not completed", true);
+    return true;
+  }
+  if (exclusive_) {
+    requestError(request.requestId, "video_job_running",
+                 "a video job holds the GPU; retry when it completes", true);
     return true;
   }
   uint64_t nowUnix = clocks_.unixMicros();
@@ -321,6 +333,64 @@ bool NativeRuntime::handleRequest(protocol::RequestFrame &request) {
     return false;
   }
   return true;
+}
+
+bool NativeRuntime::handleHiddenStates(
+    protocol::HiddenStatesRequestFrame &request) {
+  if (telemetry_.contains(request.requestId)) {
+    return handleIssue({protocol::FailureClass::ProtocolFatal,
+                        protocol::IssueCode::InvalidRequestId,
+                        request.requestId, "request id is already active"});
+  }
+  if (!ready_ || !video_.hiddenStates) {
+    requestError(request.requestId, "unsupported",
+                 "the engine serves no video model");
+    return true;
+  }
+  // The encoder runs on the engine's one command stream, between requests.
+  if (!core_.idle() || core_.commandInFlight()) {
+    requestError(request.requestId, "engine_busy",
+                 "hidden states run while no generation request is in flight",
+                 true);
+    return true;
+  }
+  std::vector<float> values;
+  uint64_t wallMicros = 0;
+  try {
+    values = video_.hiddenStates(request.promptTokens, request.layer,
+                                 wallMicros);
+  } catch (const std::invalid_argument &error) {
+    requestError(request.requestId, "invalid_request", error.what());
+    return true;
+  } catch (const metal::MetalAllocationError &error) {
+    requestError(request.requestId, "insufficient_memory", error.what(), true);
+    return true;
+  } catch (...) {
+    executionFailed(std::current_exception());
+    return false;
+  }
+  const auto rows = static_cast<uint32_t>(request.promptTokens.size());
+  const auto width = rows ? static_cast<uint32_t>(values.size() / rows) : 0;
+  return send(protocol::HiddenStatesEvent{request.requestId, rows, width,
+                                          wallMicros, std::move(values)});
+}
+
+bool NativeRuntime::handleExclusive(const protocol::ExclusiveFrame &request) {
+  if (!ready_ || !video_.exclusive) {
+    return send(protocol::ExclusiveDoneEvent{request.correlationId, false});
+  }
+  ExclusiveOutcome outcome;
+  try {
+    // Refuse new requests before releasing what they would need.
+    exclusive_ = request.acquire;
+    outcome = video_.exclusive(request.acquire);
+  } catch (...) {
+    executionFailed(std::current_exception());
+    return false;
+  }
+  return send(protocol::ExclusiveDoneEvent{
+      request.correlationId, exclusive_, outcome.releasedBytes,
+      outcome.residentBytes, outcome.footprintBytes});
 }
 
 bool NativeRuntime::handleCancel(const protocol::CancelFrame &cancel) {

@@ -386,6 +386,10 @@ std::vector<Message> everyOtherMessage() {
       CapacityExhaustedEvent{92, 40, 12, 50'000},
       StatusJsonEvent{808, kStatusSchemaVersion,
                       "{\n  \"schema_version\": 4, \"ready\": true\n}"},
+      HiddenStatesRequestFrame{93, 50, {32, 20748, 0xffffffffU}},
+      ExclusiveFrame{809, true},
+      HiddenStatesEvent{93, 2, 3, 1500, {1.0f, -2.5f, 0.0f, 3.0e4f, -0.0f, 1e-7f}},
+      ExclusiveDoneEvent{809, true, 1ULL << 33, 123456789, 987654321},
   };
 }
 
@@ -410,6 +414,70 @@ void testEveryMessageAndMultiplexedStream() {
     CHECK(test, decoded);
     if (decoded)
       CHECK(test, *decoded.value == expected[index]);
+  }
+}
+
+// The video model's frames: their fixed layouts and the bounds the decoder
+// checks before any payload is trusted.
+void testVideoFrames() {
+  constexpr std::string_view test = "video frames";
+  const HiddenStatesRequestFrame request{0x0102030405060708ULL, 50,
+                                         {7, 8, 9}};
+  auto wire = serializeMessage(Message{request});
+  CHECK(test, wire);
+  if (wire) {
+    const std::vector<uint8_t> &bytes = *wire.value;
+    CHECK(test, loadU16(bytes, 8) == 0x0005);
+    CHECK(test, loadU64(bytes, 12) == 16 + 3 * 4);
+    CHECK(test, loadU64(bytes, 24) == request.requestId);
+    CHECK(test, loadU32(bytes, 32) == 50);
+    CHECK(test, loadU32(bytes, 36) == 3);
+    CHECK(test, loadU32(bytes, 40) == 7);
+  }
+  CHECK(test, roundTrip(request) == request);
+  const HiddenStatesEvent states{5, 1, 4, 99, {1.5f, -1.5f, 2.0f, 0.25f}};
+  CHECK(test, roundTrip(states) == states);
+  CHECK(test, roundTrip(ExclusiveFrame{3, false}) == (ExclusiveFrame{3, false}));
+  const ExclusiveDoneEvent done{3, false, 0, 17, 29};
+  CHECK(test, roundTrip(done) == done);
+
+  // A zero layer, an empty prompt and a zero id are request errors of that
+  // request; values that do not fill rows x width cannot be encoded.
+  for (const HiddenStatesRequestFrame &invalid :
+       {HiddenStatesRequestFrame{9, 0, {1}}, HiddenStatesRequestFrame{9, 50, {}},
+        HiddenStatesRequestFrame{0, 50, {1}}}) {
+    auto encoded = serializeMessage(Message{invalid});
+    CHECK(test, !encoded);
+    if (!encoded)
+      CHECK(test, encoded.issue->failureClass == FailureClass::RequestError);
+  }
+  CHECK(test, !serializeMessage(Message{HiddenStatesEvent{5, 2, 4, 0, {1.0f}}}));
+
+  // A prompt count that disagrees with the payload, and an acquire byte
+  // other than 0 or 1, are framing failures.
+  auto counted = encodeMessage(Message{request});
+  CHECK(test, counted);
+  if (counted) {
+    Frame frame = *counted.value;
+    storeU32(frame.payload, 12, 4);
+    auto decoded = decodeFrame(frame);
+    CHECK(test, !decoded);
+    if (!decoded)
+      CHECK(test, decoded.issue->failureClass == FailureClass::ProtocolFatal);
+  }
+  auto exclusive = encodeMessage(Message{ExclusiveFrame{4, true}});
+  CHECK(test, exclusive);
+  if (exclusive) {
+    Frame frame = *exclusive.value;
+    frame.payload[8] = 2;
+    CHECK(test, !decodeFrame(frame));
+  }
+  auto truncated = encodeMessage(Message{states});
+  CHECK(test, truncated);
+  if (truncated) {
+    Frame frame = *truncated.value;
+    frame.payload.pop_back();
+    CHECK(test, !decodeFrame(frame));
   }
 }
 
@@ -1084,6 +1152,7 @@ int main() {
     testRequestWireAndRoundTrip();
     testScoreRequestAndDoneLogits();
     testEveryMessageAndMultiplexedStream();
+    testVideoFrames();
     testOneByteIncrementalParsing();
     testLargeIncrementalFrameHasNoGeometricCapacitySlack();
     testHeaderFailures();

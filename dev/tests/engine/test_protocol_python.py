@@ -15,22 +15,22 @@ ROOT = Path(__file__).parents[3]
 
 
 REQUEST_GOLDEN = (
-    "53504c4807001800010000005c0000000000000000000000efcdab8967452301"
+    "53504c4808001800010000005c0000000000000000000000efcdab8967452301"
     "000201008098281765060040a5ae0200000000008000000500000000000000cd"
     "cc4c3f3333733f200000001032547698badcfe00000000000200000000000000"
     "00000000010000002a00000000000080ffffffff"
 )
 ERROR_GOLDEN = (
-    "53504c4807001800050100002700000000000000000000000200000000000000"
+    "53504c4808001800050100002700000000000000000000000200000000000000"
     "0000090000000c0000006770755f6661756c744d6574616c206661696c6564"
 )
 STATUS_GOLDEN = (
-    "53504c4807001800070100002d00000000000000000000002803000000000000"
+    "53504c4808001800070100002d00000000000000000000002803000000000000"
     "050000007b22736368656d615f76657273696f6e223a342c227265616479223a"
     "747275657d"
 )
 INITIAL_MASK_GOLDEN = (
-    "53504c4807001800030100001800000000000000000000005b00000000000000"
+    "53504c4808001800030100001800000000000000000000005b00000000000000"
     "06000000000000000400000000000000"
 )
 
@@ -120,6 +120,10 @@ int main() {
     show(StatusJsonEvent{
         808, kStatusSchemaVersion,
         "{\n  \"schema_version\": 4, \"ready\": true\n}"});
+    show(HiddenStatesRequestFrame{93, 50, {32, 20748, 0xffffffffU}});
+    show(ExclusiveFrame{809, true});
+    show(HiddenStatesEvent{93, 1, 3, 1500, {1.0f, -2.5f, 3.0e4f}});
+    show(ExclusiveDoneEvent{809, true, 1ULL << 33, 123456789, 987654321});
 }
 """
 
@@ -239,6 +243,10 @@ def all_messages():
             p.STATUS_SCHEMA_VERSION,
             b'{\n  "schema_version": 4, "ready": true\n}',
         ),
+        p.HiddenStatesRequestFrame(93, 50, (32, 20748, 0xFFFFFFFF)),
+        p.ExclusiveFrame(809, True),
+        p.HiddenStatesEvent(93, 1, 3, 1500, struct.pack("<3f", 1.0, -2.5, 3.0e4)),
+        p.ExclusiveDoneEvent(809, True, 1 << 33, 123456789, 987654321),
     ]
 
 
@@ -394,6 +402,39 @@ class ProtocolPythonTests(unittest.TestCase):
                 self.assertEqual(struct.unpack_from("<Q", wire, len(wire) - 8)[0], bits)
                 ready = p.decode_frame(parse_all(wire)[0])
                 self.assertIs(ready.vision, vision)
+
+    def test_video_frames_layout_and_validation(self):
+        wire = p.serialize_message(p.HiddenStatesRequestFrame(5, 50, (7, 8, 9)))
+        self.assertEqual(struct.unpack_from("<H", wire, 8)[0], 0x0005)
+        self.assertEqual(struct.unpack_from("<QII3I", wire, 24), (5, 50, 3, 7, 8, 9))
+        ready = p.decode_frame(
+            parse_all(p.serialize_message(p.ReadyEvent(1, 4, 1024, 1 << 5)))[0]
+        )
+        self.assertTrue(ready.video)
+        for invalid in (
+            p.HiddenStatesRequestFrame(5, 0, (1,)),
+            p.HiddenStatesRequestFrame(5, 50, ()),
+            p.HiddenStatesRequestFrame(0, 50, (1,)),
+        ):
+            with (
+                self.subTest(frame=invalid),
+                self.assertRaises(p.ProtocolError) as raised,
+            ):
+                p.serialize_message(invalid)
+            self.assertIs(
+                raised.exception.issue.failure_class, p.FailureClass.REQUEST_ERROR
+            )
+        with self.assertRaises(p.ProtocolError):
+            p.serialize_message(p.HiddenStatesEvent(5, 2, 2, 0, b"\0" * 12))
+        frame = p.encode_message(p.HiddenStatesEvent(5, 1, 2, 0, b"\0" * 8))
+        with self.assertRaises(p.ProtocolError) as raised:
+            p.decode_frame(p.Frame(frame.type, frame.payload[:-1]))
+        self.assertIs(
+            raised.exception.issue.failure_class, p.FailureClass.PROTOCOL_FATAL
+        )
+        frame = p.encode_message(p.ExclusiveFrame(3, True))
+        with self.assertRaises(p.ProtocolError):
+            p.decode_frame(p.Frame(frame.type, frame.payload[:8] + b"\x02"))
 
     def test_progress_wire_validation(self):
         request = replace(example_request(), return_progress=True)

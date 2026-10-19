@@ -12,6 +12,7 @@
 #include <string>
 #include <unordered_map>
 #include <utility>
+#include <vector>
 
 namespace splash::engine {
 
@@ -20,6 +21,26 @@ struct NativeLoopConfig {
   uint64_t engineInstanceId = 1;
   uint32_t maskWordsPerToken = 1;
   RuntimeMetrics *metrics = nullptr;
+  // The engine serves a video model (FeatureVideo); its handlers are
+  // installed with setVideoHandlers.
+  bool video = false;
+};
+
+// What an exclusive handoff did (protocol::ExclusiveDoneEvent).
+struct ExclusiveOutcome {
+  uint64_t releasedBytes = 0;
+  uint64_t residentBytes = 0;
+  uint64_t footprintBytes = 0;
+};
+
+// The video model's work in the engine (main.mm): its text encoder, and the
+// memory handoff of an exclusive video job. Request errors throw
+// std::invalid_argument; a refused allocation throws
+// metal::MetalAllocationError and fails only its request.
+struct VideoHandlers {
+  std::function<std::vector<float>(std::span<const uint32_t> tokens, uint32_t layer, uint64_t &wallMicros)>
+      hiddenStates;
+  std::function<ExclusiveOutcome(bool acquire)> exclusive;
 };
 
 struct NativeLoopClocks {
@@ -50,6 +71,10 @@ public:
   void setCompletionNotifier(std::function<void()> notifier) {
     core_.setCompletionNotifier(std::move(notifier));
   }
+  // Installed before the transport runs when the engine serves a video model.
+  void setVideoHandlers(VideoHandlers handlers) { video_ = std::move(handlers); }
+  // A video job holds the GPU: generation requests are refused.
+  [[nodiscard]] bool exclusive() const noexcept { return exclusive_; }
 
   void observePrefill(uint32_t rows, double wallMilliseconds) {
     core_.observePrefill(rows, wallMilliseconds);
@@ -106,6 +131,8 @@ private:
   bool handleCancel(const protocol::CancelFrame &cancel);
   bool handleMask(const protocol::MaskResponseFrame &mask);
   bool handleStatus(const protocol::StatusRequestFrame &status);
+  bool handleHiddenStates(protocol::HiddenStatesRequestFrame &request);
+  bool handleExclusive(const protocol::ExclusiveFrame &request);
   bool handleMaskIssue(protocol::ProtocolIssue issue);
   bool handleIssue(protocol::ProtocolIssue issue);
   void requestError(uint64_t requestId, std::string code, std::string message,
@@ -147,6 +174,8 @@ private:
   std::unordered_map<uint64_t, RequestTelemetry> telemetry_;
   std::unordered_map<uint64_t, PendingMask> pendingMasks_;
   uint64_t nextMaskRequestId_ = 1;
+  VideoHandlers video_;
+  bool exclusive_ = false;
   bool ready_ = false;
   bool closeConnection_ = false;
   bool engineHealthy_ = true;

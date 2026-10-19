@@ -95,6 +95,21 @@ public:
     });
   }
 
+  // Ends residency now, as a lapsed keep-alive does: a video job takes the
+  // memory (engine/NativeRuntime.hpp, Exclusive). The next command, or use(),
+  // requests it again.
+  void lapse() {
+    dispatch_sync(queue_, ^{
+      {
+        std::lock_guard lock(mutex_);
+        if (!held_) return;
+        held_ = false;
+      }
+      dispatch_source_set_timer(heartbeat_, DISPATCH_TIME_FOREVER, 0, 0);
+      release();
+    });
+  }
+
   // The bytes of the set while it is not held.
   [[nodiscard]] uint64_t lapsedBytes() const {
     std::lock_guard lock(mutex_);

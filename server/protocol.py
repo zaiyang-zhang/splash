@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from enum import IntEnum, IntFlag
 from typing import TypeAlias
 
-PROTOCOL_VERSION = 7
+PROTOCOL_VERSION = 8
 FRAME_HEADER_BYTES = 24
 STATUS_SCHEMA_VERSION = 5
 # Largest top-k the native sampler keeps as candidates.
@@ -43,6 +43,10 @@ _DONE = struct.Struct("<QBIIQQQ")
 _ERROR = struct.Struct("<BBQII")
 _CAPACITY_EXHAUSTED = struct.Struct("<QIIQ")
 _STATUS_JSON = struct.Struct("<QI")
+_HIDDEN_STATES_REQUEST = struct.Struct("<QII")
+_EXCLUSIVE = struct.Struct("<QB")
+_HIDDEN_STATES = struct.Struct("<QIIQ")
+_EXCLUSIVE_DONE = struct.Struct("<QBQQQ")
 
 assert (
     array.array("I").itemsize == 4
@@ -55,6 +59,10 @@ assert _IMAGE_SPAN.size == 32
 assert _START.size == 21
 assert _DONE.size == 41
 assert _ERROR.size == 18
+assert _HIDDEN_STATES_REQUEST.size == 16
+assert _EXCLUSIVE.size == 9
+assert _HIDDEN_STATES.size == 24
+assert _EXCLUSIVE_DONE.size == 33
 
 REQUEST_FIXED_BYTES = _REQUEST.size
 IMAGE_SPAN_BYTES = _IMAGE_SPAN.size
@@ -65,6 +73,8 @@ class FrameType(IntEnum):
     CANCEL = 0x0002
     MASK_RESPONSE = 0x0003
     STATUS_REQUEST = 0x0004
+    HIDDEN_STATES_REQUEST = 0x0005
+    EXCLUSIVE = 0x0006
 
     READY = 0x0100
     START = 0x0101
@@ -75,6 +85,8 @@ class FrameType(IntEnum):
     CAPACITY_EXHAUSTED = 0x0106
     STATUS_JSON = 0x0107
     PROMPT_PROGRESS = 0x0108
+    HIDDEN_STATES = 0x0109
+    EXCLUSIVE_DONE = 0x010A
 
 
 class FailureClass(IntEnum):
@@ -254,6 +266,24 @@ class StatusRequestFrame:
     correlation_id: int
 
 
+@dataclass(slots=True, frozen=True)
+class HiddenStatesRequestFrame:
+    """The video model's text encoder: hidden states of every prompt token
+    after ``layer`` decoder layers (runtime/model/QwenEncoder.hpp)."""
+
+    request_id: int
+    layer: int
+    prompt_tokens: tuple[int, ...]
+
+
+@dataclass(slots=True, frozen=True)
+class ExclusiveFrame:
+    """Hands the GPU to a video job (acquire) or takes it back."""
+
+    correlation_id: int
+    acquire: bool
+
+
 class ReadyFeature(IntFlag):
     CANCELLATION = 1 << 0
     TOKEN_MASKS = 1 << 1
@@ -261,6 +291,8 @@ class ReadyFeature(IntFlag):
     MULTIPLEXING = 1 << 3
     # Requests may carry image spans; clear for a model serving without vision.
     VISION = 1 << 4
+    # The engine serves a video model: hidden states and exclusive handoffs.
+    VIDEO = 1 << 5
 
 
 @dataclass(slots=True, frozen=True)
@@ -273,6 +305,10 @@ class ReadyEvent:
     @property
     def vision(self) -> bool:
         return bool(int(self.feature_bits) & ReadyFeature.VISION)
+
+    @property
+    def video(self) -> bool:
+        return bool(int(self.feature_bits) & ReadyFeature.VIDEO)
 
 
 class CacheDisposition(IntEnum):
@@ -365,11 +401,34 @@ class StatusJsonEvent:
     json: bytes
 
 
+@dataclass(slots=True, frozen=True)
+class HiddenStatesEvent:
+    request_id: int
+    rows: int
+    width: int
+    wall_micros: int
+    # f32 [rows][width], little-endian, row major.
+    values: bytes
+
+
+@dataclass(slots=True, frozen=True)
+class ExclusiveDoneEvent:
+    correlation_id: int
+    acquired: bool
+    released_bytes: int
+    resident_bytes: int
+    footprint_bytes: int
+
+
 Message: TypeAlias = (
     RequestFrame
     | CancelFrame
     | MaskResponseFrame
     | StatusRequestFrame
+    | HiddenStatesRequestFrame
+    | ExclusiveFrame
+    | HiddenStatesEvent
+    | ExclusiveDoneEvent
     | ReadyEvent
     | StartEvent
     | PromptProgressEvent
@@ -569,6 +628,18 @@ def _payload_bounds(frame_type: FrameType, limits: ProtocolLimits) -> tuple[int,
                 _STATUS_JSON.size,
                 _STATUS_JSON.size + limits.max_status_json_bytes,
             )
+        case FrameType.HIDDEN_STATES_REQUEST:
+            bounds = (
+                _HIDDEN_STATES_REQUEST.size,
+                _HIDDEN_STATES_REQUEST.size + limits.max_prompt_tokens * 4,
+            )
+        case FrameType.EXCLUSIVE:
+            bounds = (_EXCLUSIVE.size, _EXCLUSIVE.size)
+        case FrameType.HIDDEN_STATES:
+            # The hidden states dominate; the frame limit is the bound.
+            bounds = (_HIDDEN_STATES.size, limits.max_frame_payload_bytes)
+        case FrameType.EXCLUSIVE_DONE:
+            bounds = (_EXCLUSIVE_DONE.size, _EXCLUSIVE_DONE.size)
     return bounds[0], min(bounds[1], limits.max_frame_payload_bytes)
 
 
@@ -854,6 +925,60 @@ def _cancel_issue(cancel: CancelFrame) -> ProtocolIssue | None:
         IssueCode.INVALID_REQUEST_ID,
         "cancel request id must be non-zero",
     )
+
+
+def _hidden_states_request_issue(
+    request: HiddenStatesRequestFrame, limits: ProtocolLimits
+) -> ProtocolIssue | None:
+    try:
+        request_id = _u64(request.request_id, "hidden states request id")
+        layer = _u32(request.layer, "hidden states layer")
+        tokens = _words(request.prompt_tokens, "prompt tokens")
+    except ValueError as error:
+        return _issue(
+            FailureClass.REQUEST_ERROR,
+            IssueCode.INTEGER_OVERFLOW,
+            str(error),
+        )
+    if not request_id:
+        return _issue(
+            FailureClass.REQUEST_ERROR,
+            IssueCode.INVALID_REQUEST_ID,
+            "request id must be non-zero",
+        )
+    if not layer or not tokens or len(tokens) > limits.max_prompt_tokens:
+        return _issue(
+            FailureClass.REQUEST_ERROR,
+            IssueCode.INVALID_COUNT,
+            "hidden states take a layer and 1 or more prompt tokens within the "
+            "prompt limit",
+            request_id,
+        )
+    return None
+
+
+def _hidden_states_issue(
+    event: HiddenStatesEvent, failure: FailureClass
+) -> ProtocolIssue | None:
+    if not isinstance(event.request_id, int) or not event.request_id:
+        return _issue(
+            failure,
+            IssueCode.INVALID_REQUEST_ID,
+            "hidden states request id must be non-zero",
+        )
+    if (
+        not event.rows
+        or not event.width
+        or not isinstance(event.values, bytes)
+        or len(event.values) != event.rows * event.width * 4
+    ):
+        return _issue(
+            failure,
+            IssueCode.INVALID_COUNT,
+            "hidden states must hold rows x width values",
+            event.request_id,
+        )
+    return None
 
 
 def _mask_payload(values):
@@ -1222,6 +1347,42 @@ def _encode_message(
             )
         payload = _STATUS_REQUEST.pack(correlation_id)
         frame_type = FrameType.STATUS_REQUEST
+    elif isinstance(message, HiddenStatesRequestFrame):
+        _raise_issue(_hidden_states_request_issue(message, limits))
+        tokens = _words(message.prompt_tokens, "prompt tokens")
+        payload = _HIDDEN_STATES_REQUEST.pack(
+            message.request_id, message.layer, len(tokens)
+        ) + _pack_words(tokens)
+        frame_type = FrameType.HIDDEN_STATES_REQUEST
+    elif isinstance(message, ExclusiveFrame):
+        try:
+            correlation_id = _u64(message.correlation_id, "exclusive correlation id")
+        except ValueError as error:
+            _fail(
+                FailureClass.REQUEST_ERROR,
+                IssueCode.INTEGER_OVERFLOW,
+                str(error),
+            )
+        payload = _EXCLUSIVE.pack(correlation_id, bool(message.acquire))
+        frame_type = FrameType.EXCLUSIVE
+    elif isinstance(message, HiddenStatesEvent):
+        _raise_issue(_hidden_states_issue(message, FailureClass.ENGINE_UNHEALTHY))
+        payload = (
+            _HIDDEN_STATES.pack(
+                message.request_id, message.rows, message.width, message.wall_micros
+            )
+            + message.values
+        )
+        frame_type = FrameType.HIDDEN_STATES
+    elif isinstance(message, ExclusiveDoneEvent):
+        payload = _EXCLUSIVE_DONE.pack(
+            message.correlation_id,
+            bool(message.acquired),
+            message.released_bytes,
+            message.resident_bytes,
+            message.footprint_bytes,
+        )
+        frame_type = FrameType.EXCLUSIVE_DONE
     elif isinstance(message, ReadyEvent):
         _raise_issue(_ready_issue(message, FailureClass.ENGINE_UNHEALTHY))
         payload = _READY.pack(
@@ -1325,6 +1486,8 @@ def _encode_message(
             FrameType.CANCEL,
             FrameType.MASK_RESPONSE,
             FrameType.STATUS_REQUEST,
+            FrameType.HIDDEN_STATES_REQUEST,
+            FrameType.EXCLUSIVE,
         }
         request_id = getattr(message, "request_id", 0)
         raise ProtocolError(
@@ -1586,6 +1749,56 @@ def _decode_frame(frame: Frame, limits: ProtocolLimits = ProtocolLimits()) -> Me
         return message
     if frame_type is FrameType.STATUS_REQUEST:
         return StatusRequestFrame(_STATUS_REQUEST.unpack(payload)[0])
+    if frame_type is FrameType.HIDDEN_STATES_REQUEST:
+        request_id, layer, count = _HIDDEN_STATES_REQUEST.unpack_from(payload)
+        try:
+            tokens = _unpack_words(payload, _HIDDEN_STATES_REQUEST.size, count)
+        except ValueError:
+            _fail(
+                FailureClass.PROTOCOL_FATAL,
+                IssueCode.INVALID_PAYLOAD_LENGTH,
+                "hidden states prompt count does not match the binary payload",
+                request_id,
+            )
+        message = HiddenStatesRequestFrame(request_id, layer, tokens)
+        _raise_issue(_hidden_states_request_issue(message, limits))
+        return message
+    if frame_type is FrameType.EXCLUSIVE:
+        correlation_id, acquire = _EXCLUSIVE.unpack(payload)
+        if acquire > 1:
+            _fail(
+                FailureClass.PROTOCOL_FATAL,
+                IssueCode.INVALID_PAYLOAD_LENGTH,
+                "exclusive payload is invalid",
+            )
+        return ExclusiveFrame(correlation_id, bool(acquire))
+    if frame_type is FrameType.HIDDEN_STATES:
+        request_id, rows, width, wall_micros = _HIDDEN_STATES.unpack_from(payload)
+        if len(payload) - _HIDDEN_STATES.size != rows * width * 4:
+            _fail(
+                FailureClass.PROTOCOL_FATAL,
+                IssueCode.INVALID_PAYLOAD_LENGTH,
+                "hidden states do not match the binary payload",
+                request_id,
+            )
+        message = HiddenStatesEvent(
+            request_id, rows, width, wall_micros, bytes(payload[_HIDDEN_STATES.size :])
+        )
+        _raise_issue(_hidden_states_issue(message, FailureClass.PROTOCOL_FATAL))
+        return message
+    if frame_type is FrameType.EXCLUSIVE_DONE:
+        correlation_id, acquired, released, resident, footprint = (
+            _EXCLUSIVE_DONE.unpack(payload)
+        )
+        if acquired > 1:
+            _fail(
+                FailureClass.PROTOCOL_FATAL,
+                IssueCode.INVALID_PAYLOAD_LENGTH,
+                "exclusive done payload is invalid",
+            )
+        return ExclusiveDoneEvent(
+            correlation_id, bool(acquired), released, resident, footprint
+        )
     if frame_type is FrameType.READY:
         message = ReadyEvent(*_READY.unpack(payload))
         _raise_issue(_ready_issue(message, FailureClass.PROTOCOL_FATAL))

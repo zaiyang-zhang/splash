@@ -34,6 +34,10 @@ constexpr uint64_t kDoneFixedBytes = 45;
 constexpr uint64_t kErrorFixedBytes = 18;
 constexpr uint64_t kCapacityExhaustedFixedBytes = 24;
 constexpr uint64_t kStatusJsonFixedBytes = 12;
+constexpr uint64_t kHiddenStatesRequestFixedBytes = 16;
+constexpr uint64_t kExclusiveFixedBytes = 9;
+constexpr uint64_t kHiddenStatesFixedBytes = 24;
+constexpr uint64_t kExclusiveDoneFixedBytes = 33;
 
 struct PayloadBounds {
   uint64_t minimum = 0;
@@ -144,6 +148,19 @@ std::optional<PayloadBounds> payloadBounds(FrameType type,
       return std::nullopt;
     }
     return bounded(kStatusJsonFixedBytes, maximum);
+  case FrameType::HiddenStatesRequest:
+    if (!checkedMultiply(limits.maxPromptTokens, sizeof(uint32_t), variable) ||
+        !checkedAdd(kHiddenStatesRequestFixedBytes, variable, maximum)) {
+      return std::nullopt;
+    }
+    return bounded(kHiddenStatesRequestFixedBytes, maximum);
+  case FrameType::Exclusive:
+    return bounded(kExclusiveFixedBytes, kExclusiveFixedBytes);
+  case FrameType::HiddenStates:
+    // The hidden states dominate; the frame limit is the bound.
+    return bounded(kHiddenStatesFixedBytes, limits.maxFramePayloadBytes);
+  case FrameType::ExclusiveDone:
+    return bounded(kExclusiveDoneFixedBytes, kExclusiveDoneFixedBytes);
   }
   return std::nullopt;
 }
@@ -189,6 +206,10 @@ bool validFrameType(uint16_t raw, FrameType &type) {
   case FrameType::Error:
   case FrameType::CapacityExhausted:
   case FrameType::StatusJson:
+  case FrameType::HiddenStatesRequest:
+  case FrameType::Exclusive:
+  case FrameType::HiddenStates:
+  case FrameType::ExclusiveDone:
     type = static_cast<FrameType>(raw);
     return true;
   }
@@ -669,6 +690,86 @@ std::optional<ProtocolIssue> validateStatusJson(const StatusJsonEvent &event,
                      "status JSON byte count exceeds its safe limit");
   }
   return std::nullopt;
+}
+
+std::optional<ProtocolIssue>
+validateHiddenStatesRequest(const HiddenStatesRequestFrame &request,
+                            const ProtocolLimits &limits) {
+  if (!request.requestId) {
+    return makeIssue(FailureClass::RequestError, IssueCode::InvalidRequestId, 0,
+                     "request id must be non-zero");
+  }
+  if (!request.layer || request.promptTokens.empty() ||
+      request.promptTokens.size() > limits.maxPromptTokens) {
+    return makeIssue(FailureClass::RequestError, IssueCode::InvalidCount,
+                     request.requestId,
+                     "hidden states take a layer and 1 or more prompt tokens "
+                     "within the prompt limit");
+  }
+  return std::nullopt;
+}
+
+std::optional<ProtocolIssue> validateHiddenStates(const HiddenStatesEvent &event,
+                                                  FailureClass failureClass) {
+  if (!event.requestId) {
+    return makeIssue(failureClass, IssueCode::InvalidRequestId, 0,
+                     "hidden states request id must be non-zero");
+  }
+  uint64_t values = 0;
+  if (!event.rows || !event.width ||
+      !checkedMultiply(event.rows, event.width, values) ||
+      values != event.values.size()) {
+    return makeIssue(failureClass, IssueCode::InvalidCount, event.requestId,
+                     "hidden states must hold rows x width values");
+  }
+  return std::nullopt;
+}
+
+ProtocolResult<Frame>
+encodeHiddenStatesRequest(const HiddenStatesRequestFrame &request,
+                          const ProtocolLimits &limits) {
+  if (auto issue = validateHiddenStatesRequest(request, limits)) {
+    return failure<Frame>(std::move(*issue));
+  }
+  Writer writer(kHiddenStatesRequestFixedBytes +
+                request.promptTokens.size() * sizeof(uint32_t));
+  writer.u64(request.requestId);
+  writer.u32(request.layer);
+  writer.u32(static_cast<uint32_t>(request.promptTokens.size()));
+  for (uint32_t token : request.promptTokens)
+    writer.u32(token);
+  return success(Frame{FrameType::HiddenStatesRequest, writer.take()});
+}
+
+ProtocolResult<Frame> encodeExclusive(const ExclusiveFrame &request) {
+  Writer writer(kExclusiveFixedBytes);
+  writer.u64(request.correlationId);
+  writer.u8(request.acquire ? 1 : 0);
+  return success(Frame{FrameType::Exclusive, writer.take()});
+}
+
+ProtocolResult<Frame> encodeHiddenStates(const HiddenStatesEvent &event) {
+  if (auto issue = validateHiddenStates(event, FailureClass::EngineUnhealthy)) {
+    return failure<Frame>(std::move(*issue));
+  }
+  Writer writer(kHiddenStatesFixedBytes + event.values.size() * sizeof(float));
+  writer.u64(event.requestId);
+  writer.u32(event.rows);
+  writer.u32(event.width);
+  writer.u64(event.wallMicros);
+  for (float value : event.values)
+    writer.f32(value);
+  return success(Frame{FrameType::HiddenStates, writer.take()});
+}
+
+ProtocolResult<Frame> encodeExclusiveDone(const ExclusiveDoneEvent &event) {
+  Writer writer(kExclusiveDoneFixedBytes);
+  writer.u64(event.correlationId);
+  writer.u8(event.acquired ? 1 : 0);
+  writer.u64(event.releasedBytes);
+  writer.u64(event.residentBytes);
+  writer.u64(event.footprintBytes);
+  return success(Frame{FrameType::ExclusiveDone, writer.take()});
 }
 
 ProtocolResult<Frame> encodeRequest(const RequestFrame &request,
@@ -1264,6 +1365,98 @@ ProtocolResult<Message> decodeStatusJson(const Frame &frame,
   return success(Message{std::move(event)});
 }
 
+ProtocolResult<Message> decodeHiddenStatesRequest(const Frame &frame,
+                                                  const ProtocolLimits &limits) {
+  Reader reader(frame.payload);
+  HiddenStatesRequestFrame request;
+  uint32_t tokenCount = 0;
+  if (!reader.u64(request.requestId) || !reader.u32(request.layer) ||
+      !reader.u32(tokenCount)) {
+    return failure<Message>(makeIssue(
+        FailureClass::ProtocolFatal, IssueCode::InvalidPayloadLength, 0,
+        "hidden states request fixed payload is truncated"));
+  }
+  uint64_t expectedBytes = 0;
+  if (!checkedMultiply(tokenCount, sizeof(uint32_t), expectedBytes) ||
+      reader.remaining() != expectedBytes) {
+    return failure<Message>(makeIssue(
+        FailureClass::ProtocolFatal, IssueCode::InvalidPayloadLength,
+        request.requestId,
+        "hidden states prompt count does not match the binary payload"));
+  }
+  if (tokenCount > limits.maxPromptTokens ||
+      !reader.words(tokenCount, request.promptTokens)) {
+    return failure<Message>(makeIssue(
+        FailureClass::RequestError, IssueCode::LimitExceeded,
+        request.requestId, "hidden states prompt exceeds its limit"));
+  }
+  if (auto issue = validateHiddenStatesRequest(request, limits)) {
+    return failure<Message>(std::move(*issue));
+  }
+  return success(Message{std::move(request)});
+}
+
+ProtocolResult<Message> decodeExclusive(const Frame &frame) {
+  Reader reader(frame.payload);
+  ExclusiveFrame request;
+  uint8_t acquire = 0;
+  if (!reader.u64(request.correlationId) || !reader.u8(acquire) ||
+      reader.remaining() || acquire > 1) {
+    return failure<Message>(
+        makeIssue(FailureClass::ProtocolFatal, IssueCode::InvalidPayloadLength,
+                  0, "exclusive payload is invalid"));
+  }
+  request.acquire = acquire != 0;
+  return success(Message{request});
+}
+
+ProtocolResult<Message> decodeHiddenStates(const Frame &frame) {
+  Reader reader(frame.payload);
+  HiddenStatesEvent event;
+  if (!reader.u64(event.requestId) || !reader.u32(event.rows) ||
+      !reader.u32(event.width) || !reader.u64(event.wallMicros)) {
+    return failure<Message>(
+        makeIssue(FailureClass::ProtocolFatal, IssueCode::InvalidPayloadLength,
+                  0, "hidden states fixed payload is truncated"));
+  }
+  uint64_t values = 0;
+  uint64_t expectedBytes = 0;
+  if (!checkedMultiply(event.rows, event.width, values) ||
+      !checkedMultiply(values, sizeof(float), expectedBytes) ||
+      reader.remaining() != expectedBytes) {
+    return failure<Message>(makeIssue(
+        FailureClass::ProtocolFatal, IssueCode::InvalidPayloadLength,
+        event.requestId, "hidden states do not match the binary payload"));
+  }
+  event.values.resize(static_cast<size_t>(values));
+  for (float &value : event.values) {
+    if (!reader.f32(value)) {
+      return failure<Message>(makeIssue(FailureClass::ProtocolFatal,
+                                        IssueCode::InvalidPayloadLength, 0,
+                                        "hidden states are truncated"));
+    }
+  }
+  if (auto issue = validateHiddenStates(event, FailureClass::ProtocolFatal)) {
+    return failure<Message>(std::move(*issue));
+  }
+  return success(Message{std::move(event)});
+}
+
+ProtocolResult<Message> decodeExclusiveDone(const Frame &frame) {
+  Reader reader(frame.payload);
+  ExclusiveDoneEvent event;
+  uint8_t acquired = 0;
+  if (!reader.u64(event.correlationId) || !reader.u8(acquired) ||
+      !reader.u64(event.releasedBytes) || !reader.u64(event.residentBytes) ||
+      !reader.u64(event.footprintBytes) || reader.remaining() || acquired > 1) {
+    return failure<Message>(
+        makeIssue(FailureClass::ProtocolFatal, IssueCode::InvalidPayloadLength,
+                  0, "exclusive done payload is invalid"));
+  }
+  event.acquired = acquired != 0;
+  return success(Message{event});
+}
+
 std::string_view frameTypeName(FrameType type) {
   switch (type) {
   case FrameType::Request:
@@ -1292,6 +1485,14 @@ std::string_view frameTypeName(FrameType type) {
     return "capacity_exhausted";
   case FrameType::StatusJson:
     return "status_json";
+  case FrameType::HiddenStatesRequest:
+    return "hidden_states_request";
+  case FrameType::Exclusive:
+    return "exclusive";
+  case FrameType::HiddenStates:
+    return "hidden_states";
+  case FrameType::ExclusiveDone:
+    return "exclusive_done";
   }
   return "unknown";
 }
@@ -1391,6 +1592,14 @@ ProtocolResult<Frame> encodeMessage(const Message &message,
             return encodeMaskResponse(value, limits);
           } else if constexpr (std::is_same_v<T, StatusRequestFrame>) {
             return encodeStatusRequest(value);
+          } else if constexpr (std::is_same_v<T, HiddenStatesRequestFrame>) {
+            return encodeHiddenStatesRequest(value, limits);
+          } else if constexpr (std::is_same_v<T, ExclusiveFrame>) {
+            return encodeExclusive(value);
+          } else if constexpr (std::is_same_v<T, HiddenStatesEvent>) {
+            return encodeHiddenStates(value);
+          } else if constexpr (std::is_same_v<T, ExclusiveDoneEvent>) {
+            return encodeExclusiveDone(value);
           } else if constexpr (std::is_same_v<T, ReadyEvent>) {
             return encodeReady(value);
           } else if constexpr (std::is_same_v<T, StartEvent>) {
@@ -1420,7 +1629,9 @@ ProtocolResult<Frame> encodeMessage(const Message &message,
           encoded.value->type == FrameType::Request ||
           encoded.value->type == FrameType::Cancel ||
           encoded.value->type == FrameType::MaskResponse ||
-          encoded.value->type == FrameType::StatusRequest;
+          encoded.value->type == FrameType::StatusRequest ||
+          encoded.value->type == FrameType::HiddenStatesRequest ||
+          encoded.value->type == FrameType::Exclusive;
       issue->failureClass = clientMessage ? FailureClass::RequestError
                                           : FailureClass::EngineUnhealthy;
       issue->requestId = std::visit(
@@ -1482,6 +1693,14 @@ ProtocolResult<Message> decodeFrame(const Frame &frame,
       return decodeCapacityExhausted(frame);
     case FrameType::StatusJson:
       return decodeStatusJson(frame, limits);
+    case FrameType::HiddenStatesRequest:
+      return decodeHiddenStatesRequest(frame, limits);
+    case FrameType::Exclusive:
+      return decodeExclusive(frame);
+    case FrameType::HiddenStates:
+      return decodeHiddenStates(frame);
+    case FrameType::ExclusiveDone:
+      return decodeExclusiveDone(frame);
     }
   } catch (const std::bad_alloc &) {
     return failure<Message>(

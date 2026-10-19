@@ -284,7 +284,8 @@ ENGINE_CPP_SOURCES := \
 	runtime/model/ModelFactory.cpp \
 	runtime/model/SlotFile.cpp \
 	runtime/model/KvPageTier.cpp \
-	runtime/model/QwenState.cpp
+	runtime/model/QwenState.cpp \
+	runtime/model/QwenEncoder.cpp
 ENGINE_MM_SOURCES := \
 	runtime/model/SafetensorsCheckpoint.mm \
 	runtime/model/ModelDescriptor.mm \
@@ -293,7 +294,8 @@ ENGINE_MM_SOURCES := \
 	runtime/ops/Vision.mm \
 	runtime/ops/PageStorage.mm \
 	runtime/engine/RuntimeResources.mm \
-	runtime/engine/Bootstrap.mm
+	runtime/engine/Bootstrap.mm \
+	runtime/engine/TextEncoder.mm
 ENGINE_OBJECTS := \
 	$(patsubst runtime/%.cpp,$(ENGINE_BUILD)/%.o,$(ENGINE_CPP_SOURCES)) \
 	$(patsubst runtime/%.mm,$(ENGINE_BUILD)/%.o,$(ENGINE_MM_SOURCES)) \

@@ -1310,6 +1310,10 @@ uint64_t MetalBackend::lapsedResidentBytes() const noexcept {
     return impl_->residency->lapsedBytes();
 }
 
+void MetalBackend::lapseResidency() { impl_->residency->lapse(); }
+
+void MetalBackend::requestResidency() { impl_->residency->use(); }
+
 CommandTiming MetalBackend::submit(const ComputeDispatch &dispatch) {
     return submitAsync(dispatch).wait();
 }

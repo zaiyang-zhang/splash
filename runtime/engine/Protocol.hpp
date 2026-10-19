@@ -14,7 +14,7 @@
 
 namespace splash::protocol {
 
-inline constexpr uint16_t kProtocolVersion = 7;
+inline constexpr uint16_t kProtocolVersion = 8;
 inline constexpr size_t kFrameHeaderBytes = 24;
 inline constexpr uint32_t kStatusSchemaVersion = 5;
 // Image pixels travel inside the request frame; a multi-image agent turn can
@@ -29,6 +29,8 @@ enum class FrameType : uint16_t {
   Cancel = 0x0002,
   MaskResponse = 0x0003,
   StatusRequest = 0x0004,
+  HiddenStatesRequest = 0x0005,
+  Exclusive = 0x0006,
 
   Ready = 0x0100,
   Start = 0x0101,
@@ -39,6 +41,8 @@ enum class FrameType : uint16_t {
   CapacityExhausted = 0x0106,
   StatusJson = 0x0107,
   PromptProgress = 0x0108,
+  HiddenStates = 0x0109,
+  ExclusiveDone = 0x010A,
 };
 
 // Request errors reject one request while preserving the stream.  An
@@ -229,6 +233,32 @@ struct StatusRequestFrame {
   bool operator==(const StatusRequestFrame &) const = default;
 };
 
+// A video model's text encoder (model/QwenEncoder.hpp): the hidden states of
+// every prompt token after `layer` decoder layers. The prompt is token ids as
+// the encoder's tokenizer writes them, without a chat template. Answered by a
+// HiddenStatesEvent or a request ErrorEvent; it runs only while no generation
+// request is in flight.
+struct HiddenStatesRequestFrame {
+  uint64_t requestId = 0;
+  uint32_t layer = 0;
+  std::vector<uint32_t> promptTokens;
+
+  bool operator==(const HiddenStatesRequestFrame &) const = default;
+};
+
+// Hands the GPU to a video job (acquire) or takes it back. Acquiring refuses
+// new generation requests (video_job_running), releases the cached prefixes,
+// KV backing and the text encoder, and ends the residency of the model's
+// weights, so macOS can reclaim them; releasing serves again and wires the
+// weights from the next command. Answered by an ExclusiveDoneEvent with the
+// same correlation id.
+struct ExclusiveFrame {
+  uint64_t correlationId = 0;
+  bool acquire = false;
+
+  bool operator==(const ExclusiveFrame &) const = default;
+};
+
 enum ReadyFeature : uint64_t {
   FeatureCancellation = 1ULL << 0,
   FeatureTokenMasks = 1ULL << 1,
@@ -237,6 +267,8 @@ enum ReadyFeature : uint64_t {
   // Requests may carry image spans. A model serving without vision leaves it
   // clear and rejects each image request with a request error.
   FeatureVision = 1ULL << 4,
+  // The engine serves a video model: HiddenStatesRequest and Exclusive.
+  FeatureVideo = 1ULL << 5,
 };
 
 // The native runtime implements every other feature; ReadyEvent announces
@@ -337,6 +369,31 @@ struct CapacityExhaustedEvent {
   bool operator==(const CapacityExhaustedEvent &) const = default;
 };
 
+// f32 [rows][width] hidden states of a HiddenStatesRequest's prompt, row
+// major, and the engine's time for them.
+struct HiddenStatesEvent {
+  uint64_t requestId = 0;
+  uint32_t rows = 0;
+  uint32_t width = 0;
+  uint64_t wallMicros = 0;
+  std::vector<float> values;
+
+  bool operator==(const HiddenStatesEvent &) const = default;
+};
+
+// What an Exclusive frame did: whether the engine is now exclusive, the bytes
+// its reclaim released, and the Metal allocations and process footprint it
+// left (status fields of the same names).
+struct ExclusiveDoneEvent {
+  uint64_t correlationId = 0;
+  bool acquired = false;
+  uint64_t releasedBytes = 0;
+  uint64_t residentBytes = 0;
+  uint64_t footprintBytes = 0;
+
+  bool operator==(const ExclusiveDoneEvent &) const = default;
+};
+
 // JSON is deliberately opaque to the transport.  Its independent schema
 // number is always present, and the frame length carries the exact JSON byte
 // count (including whitespace) without line or C-string assumptions.
@@ -350,9 +407,11 @@ struct StatusJsonEvent {
 
 using Message =
     std::variant<RequestFrame, CancelFrame, MaskResponseFrame,
-                 StatusRequestFrame, ReadyEvent, StartEvent,
-                 PromptProgressEvent, TokensEvent, MaskRequestEvent, DoneEvent,
-                 ErrorEvent, CapacityExhaustedEvent, StatusJsonEvent>;
+                 StatusRequestFrame, HiddenStatesRequestFrame, ExclusiveFrame,
+                 ReadyEvent, StartEvent, PromptProgressEvent, TokensEvent,
+                 MaskRequestEvent, DoneEvent, ErrorEvent,
+                 CapacityExhaustedEvent, StatusJsonEvent, HiddenStatesEvent,
+                 ExclusiveDoneEvent>;
 
 struct Frame {
   FrameType type = FrameType::Request;

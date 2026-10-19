@@ -387,7 +387,67 @@ ModelDescriptor inspectSourceModel(const std::filesystem::path &root) {
   return result;
 }
 
+void requireFile(const std::filesystem::path &path, std::string_view label) {
+  std::error_code error;
+  if (!std::filesystem::is_regular_file(path, error) || error)
+    throw std::invalid_argument(std::string(label) + " is missing: " + path.string());
+}
+
 } // namespace
+
+VideoModelDescriptor inspectVideoModel(const std::filesystem::path &root) {
+  @autoreleasepool {
+    NSDictionary *record = readObject(root / "model.json", "video model record");
+    requireEqual(requireUnsigned(record, @"version", "video model record version"), 1,
+                 "video model record version");
+    requireEqual(requireString(record, @"kind", "model kind"), "h3-video", "model kind");
+    VideoModelDescriptor result;
+    result.name = requireString(record, @"model", "video model name");
+    NSDictionary *encoder = requireObject(record, @"text_encoder", "text encoder");
+    result.encoder = qwen3VlEncoderLayout(
+        static_cast<uint32_t>(requireUnsigned(encoder, @"layer", "text encoder layer")));
+    result.encoderDirectory = root / "encoder";
+    NSDictionary *config = readObject(result.encoderDirectory / "config.json", "text encoder config");
+    NSDictionary *text = requireObject(config, @"text_config", "text encoder text config");
+    requireEqual(requireString(text, @"model_type", "text encoder model type"), "qwen3_vl_text",
+                 "text encoder model type");
+    requireNumbers(text, {{"hidden_size", result.encoder.hiddenSize},
+                          {"num_hidden_layers", result.encoder.sourceLayers},
+                          {"vocab_size", result.encoder.vocabularySize},
+                          {"num_attention_heads", result.encoder.queryHeads},
+                          {"num_key_value_heads", result.encoder.kvHeads},
+                          {"head_dim", result.encoder.headDimension}});
+    if (result.encoder.layers >= result.encoder.sourceLayers)
+      throw std::invalid_argument("the text encoder layer must precede the checkpoint's last layer");
+    result.weightsDirectory = root / "weights";
+    NSArray *variants = requireArray(record, @"variants", "video variants");
+    if (!variants.count) throw std::invalid_argument("a video model has at least one variant");
+    for (id entry in variants) {
+      if (![entry isKindOfClass:[NSDictionary class]])
+        throw std::invalid_argument("a video variant must be an object");
+      VideoVariant variant;
+      variant.name = requireString(entry, @"name", "video variant name");
+      if (variant.name != "turbo" && variant.name != "default")
+        throw std::invalid_argument("unsupported video variant: " + variant.name);
+      variant.steps = static_cast<uint32_t>(requireUnsigned(entry, @"steps", "video variant steps"));
+      variant.streamable = [entry[@"stream"] isEqual:@YES];
+      const std::filesystem::path dit = result.weightsDirectory / ("dit-" + variant.name);
+      requireFile(dit / "manifest.json", "DiT manifest");
+      requireFile(dit / "vdn-globals.safetensors", "DiT globals");
+      requireFile(dit / "io.safetensors", "DiT io tensors");
+      for (uint32_t block = 0; block < 50; ++block) {
+        char name[64];
+        snprintf(name, sizeof name, "vdn-w8-block%02u.safetensors", block);
+        requireFile(dit / name, "DiT block");
+      }
+      if (variant.streamable) requireFile(dit / "stream.bin", "DiT stream image");
+      result.variants.push_back(std::move(variant));
+    }
+    requireFile(result.weightsDirectory / "vae" / "manifest_w8.json", "video VAE manifest");
+    requireFile(result.weightsDirectory / "preview" / "manifest.json", "preview decoder manifest");
+    return result;
+  }
+}
 
 ModelDescriptor makeModelDescriptor(std::string name, TargetLayout target,
                                     DFlashDraftLayout draft,

@@ -4,12 +4,14 @@
 #include "Model.hpp"
 #include "Qwen3_6Moe.hpp"
 #include "Qwen3_8.hpp"
+#include "QwenEncoder.hpp"
 #include "ops/Vision.hpp"
 
 #include <cstdint>
 #include <filesystem>
 #include <string>
 #include <variant>
+#include <vector>
 
 namespace splash::model {
 
@@ -54,5 +56,32 @@ struct ModelDescriptor final {
                                                   ops::VisionLayout vision);
 [[nodiscard]] ModelDescriptor
 inspectModelPackage(const std::filesystem::path &root);
+
+// A video model, served beside the language model (serve-native --video):
+// an installation whose model.json states "kind": "h3-video". MiniMax-H3's
+// engine images live under weights/, in the vendored engine's layout
+// (runtime/video): per variant dit-<variant>/ (the int8 Hadamard-rotated
+// blocks, QKFIX fp16 tensors, globals and io tensors, and the SSD stream
+// image), vae/ (the W8 video VAE), preview/ (TAEH3) and vdn/ (the OpenVDN
+// stage checkpoints request preparation reads). Its text encoder is an MLX
+// Qwen3-VL checkpoint under encoder/, prepared and run like a language
+// model's target (QwenEncoder.hpp) up to `encoder.layers`.
+struct VideoVariant final {
+  std::string name;
+  // Denoising steps, one DiT forward each.
+  uint32_t steps = 0;
+  // The variant's weights can be streamed from SSD (stream.bin).
+  bool streamable = false;
+};
+
+struct VideoModelDescriptor final {
+  std::string name;
+  QwenEncoderLayout encoder;
+  std::filesystem::path encoderDirectory;
+  std::filesystem::path weightsDirectory;
+  std::vector<VideoVariant> variants;
+};
+
+[[nodiscard]] VideoModelDescriptor inspectVideoModel(const std::filesystem::path &root);
 
 } // namespace splash::model

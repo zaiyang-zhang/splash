@@ -3,12 +3,14 @@
 #include "engine/FdTransport.hpp"
 #include "engine/Bootstrap.hpp"
 #include "engine/Status.hpp"
+#include "engine/TextEncoder.hpp"
 #include "model/Model.hpp"
 #include "model/ModelDescriptor.hpp"
 #include "video/VideoJob.hpp"
 
 #include <dispatch/dispatch.h>
 #include <mach-o/dyld.h>
+#include <mach/mach.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -22,6 +24,8 @@
 #include <filesystem>
 #include <limits.h>
 #include <memory>
+#include <optional>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -55,6 +59,8 @@ struct NativeArguments final {
   uint64_t maxCacheDiskBytes = 0;
   kv::Format kvFormat = kv::Format::Int8;
   double decodeShare = engine::EngineConfig{}.decodeShare;
+  // The video model served beside the language model (--video VIDEO_ROOT).
+  std::optional<model::VideoModelDescriptor> video;
 };
 
 // One observer spans bootstrap and serving. The dispatch queue only records
@@ -126,7 +132,7 @@ void printUsage(std::string_view executable) {
       "usage: " + std::string(executable) +
       " serve-native TARGET_DIRECTORY DRAFT_DIRECTORY"
       " MAX_CONTEXT|auto MAX_MEMORY_BYTES|auto [MAX_CACHE_DISK_BYTES]"
-      " [--kv-format int8|bf16] [--decode-share SHARE]");
+      " [--kv-format int8|bf16] [--decode-share SHARE] [--video VIDEO_ROOT]");
 }
 
 template <typename T>
@@ -215,6 +221,8 @@ NativeArguments parseArguments(int argc, char **argv) {
       result.kvFormat = value == "int8" ? kv::Format::Int8 : kv::Format::BFloat16;
     } else if (option == "--decode-share") {
       result.decodeShare = parseDecodeShare(value);
+    } else if (option == "--video") {
+      result.video = model::inspectVideoModel(canonicalDirectory(value, "VIDEO_ROOT"));
     } else {
       throw UsageError("unexpected argument " + std::string(option));
     }
@@ -270,6 +278,7 @@ bootstrapConfig(const NativeArguments &arguments) {
   config.nativeLoop.engine.decodeShare = arguments.decodeShare;
   config.nativeLoop.engineInstanceId = engineInstanceId();
   config.nativeLoop.maskWordsPerToken = maskWordsPerToken;
+  config.nativeLoop.video = arguments.video.has_value();
   config.protocolLimits.maxTokenBatch =
       model::ExecutionLimits::maximumStepTokens;
   config.protocolLimits.maxSimulationTokens = capabilities.draftQueryRows;
@@ -319,6 +328,91 @@ public:
     gShutdownTransport.store(nullptr, std::memory_order_release);
   }
 };
+
+// The process's physical footprint, Metal allocations included.
+uint64_t processFootprint() {
+  task_vm_info_data_t info{};
+  mach_msg_type_number_t count = TASK_VM_INFO_COUNT;
+  if (task_info(mach_task_self(), TASK_VM_INFO,
+                reinterpret_cast<task_info_t>(&info), &count) != KERN_SUCCESS)
+    return 0;
+  return info.phys_footprint;
+}
+
+// The video model's handlers (NativeRuntime::setVideoHandlers): its text
+// encoder, which runs when the host can hold it beside the language model,
+// and the exclusive handoff, which reclaims what the language model's
+// requests cached, every KV extent and state, and ends the residency of its
+// weights, so the video job's process can have their memory.
+engine::VideoHandlers videoHandlers(engine::RuntimeBootstrap &published,
+                                    engine::TextEncoder &encoder) {
+  engine::RuntimeResources &resources = published.resources();
+  engine::NativeRuntime &loop = published.nativeLoop();
+  // Reclaims everything a pass may take, until nothing is pending; bounded,
+  // since a transfer that never lands must not stall the handoff.
+  const auto reclaimAll = [&loop](uint64_t target) {
+    engine::MemoryReclaimDirective directive;
+    directive.reclaimEmptyKvExtents = true;
+    directive.evictAllUnpinnedPrefixes = true;
+    directive.targetBytes = target;
+    uint64_t released = 0;
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    for (;;) {
+      const engine::MemoryReclaimResult result = loop.reclaimMemory(directive);
+      released += result.releasedBytes;
+      if ((result.outcome != engine::ReclaimOutcome::Pending &&
+           !loop.reclaimDeferred()) ||
+          std::chrono::steady_clock::now() >= deadline)
+        return released;
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+  };
+  engine::VideoHandlers handlers;
+  handlers.hiddenStates = [&resources, &encoder, reclaimAll](
+                              std::span<const uint32_t> tokens, uint32_t layer,
+                              uint64_t &wallMicros) {
+    // The encoder's weights are mapped for the request: make room for them
+    // first, beyond the host's reserve, by dropping cached prefixes.
+    const uint64_t needed = encoder.preparedBytes();
+    const uint64_t reserve =
+        resources.memoryGovernor().snapshot().hostReserveBytes;
+    auto available = engine::queryHostAvailableMemory();
+    if (!available || *available < needed + reserve) {
+      static_cast<void>(reclaimAll(needed));
+      available = engine::queryHostAvailableMemory();
+    }
+    if (!available || *available < needed + reserve)
+      throw metal::MetalAllocationError(
+          "the text encoder needs " + std::to_string(needed >> 20) +
+              " MiB beside the language model; the host has " +
+              std::to_string(available.value_or(0) >> 20) + " MiB available",
+          metal::AllocationFailure::HostPressure);
+    model::EncoderTiming timing;
+    std::vector<float> hidden = encoder.encode(
+        tokens, layer, resources.memoryGovernor().allocationAdmission(),
+        &timing);
+    wallMicros = static_cast<uint64_t>(timing.wallMilliseconds * 1000.0);
+    static_cast<void>(resources.backend().refreshMemoryStats());
+    return hidden;
+  };
+  handlers.exclusive = [&resources, reclaimAll](bool acquire) {
+    engine::ExclusiveOutcome outcome;
+    metal::MetalBackend &backend = resources.backend();
+    if (acquire) {
+      outcome.releasedBytes =
+          reclaimAll(std::numeric_limits<uint64_t>::max());
+      backend.lapseResidency();
+    } else {
+      backend.requestResidency();
+    }
+    const metal::MetalMemoryStats stats = backend.refreshMemoryStats();
+    outcome.residentBytes = stats.allocatedBytes + stats.sparseResidentBytes;
+    outcome.footprintBytes = processFootprint();
+    return outcome;
+  };
+  return handlers;
+}
 
 int runNative(const NativeArguments &arguments) {
   engine::FdTransport transport(STDIN_FILENO, STDOUT_FILENO);
@@ -380,6 +474,14 @@ int runNative(const NativeArguments &arguments) {
   if (transport.shutdownRequested())
     return static_cast<int>(engine::NativeProcessExit::CleanEof);
   published = bootstrap.get();
+  std::optional<engine::TextEncoder> textEncoder;
+  if (arguments.video) {
+    textEncoder.emplace(published->resources().backend(),
+                        arguments.video->encoderDirectory,
+                        arguments.video->encoder.layers);
+    published->nativeLoop().setVideoHandlers(
+        videoHandlers(*published, *textEncoder));
+  }
 
   transport.setControlHandler([&pressureMonitor, published,
                                memoryReporter = engine::MemoryStatusReporter{},
@@ -463,6 +565,8 @@ int main(int argc, char **argv) {
         return splash::checkDevice();
       if (argc >= 2 && std::string_view(argv[1]) == "video-native")
         return splash::video::runVideoJob(argc, argv);
+      if (argc >= 2 && std::string_view(argv[1]) == "encoder-native")
+        return splash::engine::runTextEncoderCommand(argc, argv);
       splash::NativeArguments arguments = splash::parseArguments(argc, argv);
       return splash::runNative(arguments);
     } catch (const splash::UsageError &error) {

@@ -5,6 +5,7 @@
 
 #include "metal/abi/DraftAttention.h"
 #include "metal/abi/Embedding.h"
+#include "metal/abi/Encoder.h"
 #include "metal/abi/ExecutionGeometry.h"
 #include "metal/abi/GDN.h"
 #include "metal/abi/Linear.h"

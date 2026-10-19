@@ -345,6 +345,10 @@ public:
   // The kept bytes whose residency the keep-alive has ended, until the next
   // command holds them again; Metal unwires them shortly after the end.
   [[nodiscard]] uint64_t lapsedResidentBytes() const noexcept;
+  // Ends the kept buffers' residency now instead of after the keep-alive,
+  // and requests it again before the next command would.
+  void lapseResidency();
+  void requestResidency();
 
   // Encodes exactly one compute dispatch, commits it, waits for completion,
   // and reports both GPU and end-to-end wall time.

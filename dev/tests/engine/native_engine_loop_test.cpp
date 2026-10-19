@@ -970,6 +970,113 @@ void testImageRequestWithoutVisionStaysRequestScoped() {
           "image request reached admission or stopped the engine");
 }
 
+// A video model's frames: the text encoder answers between requests, and an
+// exclusive handoff refuses generation until the GPU is taken back.
+void testVideoHandoffAndHiddenStates() {
+  Backing backing(32);
+  KvPool pool(backing);
+  engine::Cache resources(pool, CacheNamespace{});
+  Executor executor;
+  std::vector<uint8_t> output;
+  engine::NativeLoopConfig config;
+  config.engine.maxContext = 1024;
+  config.video = true;
+  engine::NativeRuntime loop(
+      config, resources, executor,
+      [&](std::span<const uint8_t> bytes) {
+        output.insert(output.end(), bytes.begin(), bytes.end());
+      },
+      [] { return std::string("{\"schema_version\":5,\"ready\":true}"); },
+      {[] { return uint64_t{1'000'000}; }, [] { return 100.0; }});
+  std::vector<bool> handoffs;
+  engine::VideoHandlers handlers;
+  handlers.hiddenStates = [](std::span<const uint32_t> tokens, uint32_t layer,
+                             uint64_t &wallMicros) {
+    if (layer != 50)
+      throw std::invalid_argument("the text encoder returns hidden states after layer 50");
+    wallMicros = 1234;
+    std::vector<float> values;
+    for (const uint32_t token : tokens)
+      for (uint32_t column = 0; column < 4; ++column)
+        values.push_back(float(token) + 0.25f * float(column));
+    return values;
+  };
+  handlers.exclusive = [&handoffs](bool acquire) {
+    handoffs.push_back(acquire);
+    return engine::ExclusiveOutcome{acquire ? 10U : 0U, 20, 30};
+  };
+  loop.setVideoHandlers(std::move(handlers));
+  loop.announceReady();
+  const auto send = [&](const protocol::Message &message) {
+    const auto wire = protocol::serializeMessage(message);
+    require(wire && loop.receive(*wire.value), "video frame closed the native connection");
+  };
+  send(protocol::HiddenStatesRequestFrame{5, 50, {1, 2, 3}});
+  send(protocol::HiddenStatesRequestFrame{6, 7, {1}});
+  send(protocol::ExclusiveFrame{11, true});
+  send(request(1));
+  send(protocol::ExclusiveFrame{12, false});
+  send(request(2));
+  runUntilIdle(loop);
+  bool ready = false, states = false, invalid = false, refused = false;
+  uint32_t handed = 0, done = 0;
+  for (const auto &message : decodeMessages(output)) {
+    if (const auto *event = std::get_if<protocol::ReadyEvent>(&message)) {
+      ready = event->featureBits & protocol::FeatureVideo;
+    } else if (const auto *event = std::get_if<protocol::HiddenStatesEvent>(&message)) {
+      states = event->requestId == 5 && event->rows == 3 && event->width == 4 &&
+               event->wallMicros == 1234 && event->values.size() == 12 &&
+               event->values[5] == 2.25f;
+    } else if (const auto *event = std::get_if<protocol::ErrorEvent>(&message)) {
+      require(event->failureClass == protocol::FailureClass::RequestError,
+              "a video request error stopped the engine");
+      invalid |= event->requestId == 6 && event->code == "invalid_request";
+      refused |= event->requestId == 1 && event->code == "video_job_running" && event->retryable;
+    } else if (const auto *event = std::get_if<protocol::ExclusiveDoneEvent>(&message)) {
+      require(event->correlationId == (handed ? 12U : 11U) && event->acquired == !handed &&
+                  event->releasedBytes == (handed ? 0U : 10U) && event->residentBytes == 20 &&
+                  event->footprintBytes == 30,
+              "exclusive handoff reported the wrong outcome");
+      ++handed;
+    } else if (const auto *event = std::get_if<protocol::DoneEvent>(&message)) {
+      require(event->requestId == 2, "generation ran during the video job");
+      ++done;
+    }
+  }
+  require(ready && states && invalid && refused && handed == 2 && done == 1 &&
+              handoffs == std::vector<bool>{true, false} && !loop.exclusive() &&
+              loop.engineHealthy(),
+          "video frames did not run, refuse and release as specified");
+
+  // An engine serving no video model answers each frame without failing.
+  std::vector<uint8_t> plainOutput;
+  engine::NativeLoopConfig plainConfig;
+  plainConfig.engine.maxContext = 1024;
+  engine::NativeRuntime plain(
+      plainConfig, resources, executor,
+      [&](std::span<const uint8_t> bytes) {
+        plainOutput.insert(plainOutput.end(), bytes.begin(), bytes.end());
+      },
+      [] { return std::string("{\"schema_version\":5,\"ready\":true}"); },
+      {[] { return uint64_t{1'000'000}; }, [] { return 100.0; }});
+  plain.announceReady();
+  for (const protocol::Message &message :
+       {protocol::Message{protocol::HiddenStatesRequestFrame{7, 50, {1}}},
+        protocol::Message{protocol::ExclusiveFrame{13, true}}}) {
+    const auto wire = protocol::serializeMessage(message);
+    require(wire && plain.receive(*wire.value), "video frame closed a plain engine");
+  }
+  bool unsupported = false, declined = false;
+  for (const auto &message : decodeMessages(plainOutput)) {
+    if (const auto *event = std::get_if<protocol::ErrorEvent>(&message))
+      unsupported = event->requestId == 7 && event->code == "unsupported";
+    if (const auto *event = std::get_if<protocol::ExclusiveDoneEvent>(&message))
+      declined = event->correlationId == 13 && !event->acquired;
+  }
+  require(unsupported && declined && !plain.exclusive(),
+          "an engine without a video model took a video frame");
+}
+
 void testStepTokensFitTheWire() {
   for (uint32_t limit : {model::ExecutionLimits::maximumStepTokens, 1U}) {
     Backing backing(32);
@@ -1357,6 +1464,7 @@ int main() {
     testInvalidPromptTokensStayRequestScoped();
     testReadyAnnouncesVisionWhenImagesAreAdmitted();
     testImageRequestWithoutVisionStaysRequestScoped();
+    testVideoHandoffAndHiddenStates();
     testStepTokensFitTheWire();
     testScoreRequestCompletesAfterFullPrompt();
     testCancelledScoreReturnsEmptyLogits();
