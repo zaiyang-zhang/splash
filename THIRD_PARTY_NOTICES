@@ -99,10 +99,31 @@ under the Apache License, Version 2.0
 
 minimax-h3-mlx (https://github.com/PipeNetwork/minimax-h3-mlx)
 
-The video VAE tile plan of runtime/video/model/Geometry.cpp and the rotary
-tables of install/video/convert_vae.py follow this MLX port of MiniMax H3,
-which the converter also imports. Licensed under the Apache License, Version
-2.0 (http://www.apache.org/licenses/LICENSE-2.0).
+The video VAE tile plan of runtime/video/model/Geometry.cpp, the rotary
+tables of install/video/convert_vae.py, the request preparation
+(runtime/video/model/Prep.mm: packed layout, rotary tables, scheduler,
+timestep embedding, token refiner) and the audio VAE decoder
+(runtime/video/ops/AudioDecoder.mm, install/video/convert_audio.py) follow
+this MLX port of MiniMax H3, which the VAE converter also imports. Licensed
+under the Apache License, Version 2.0
+(http://www.apache.org/licenses/LICENSE-2.0).
+
+
+BigVGAN (https://github.com/NVIDIA/BigVGAN)
+
+MiniMax H3's audio VAE decoder is a BigVGAN generator; its kernels
+(runtime/metal/kernels/video/audio_*.metal) implement BigVGAN's
+anti-aliased SnakeBeta activations and Kaiser-windowed sinc resampling.
+MIT License, Copyright (c) 2024 NVIDIA CORPORATION.
+
+
+MLX (https://github.com/ml-explore/mlx)
+
+The request preparation's kernels (runtime/metal/kernels/video/prep_prep.metal)
+reproduce the arithmetic of MLX 0.32.1's primitives bit for bit, among them
+its threefry random normal sampling and the K order and register layout of
+its NAX matrix multiplication (steel/gemm/nax.h). MIT License, Copyright (c)
+2023 Apple Inc.
 
 
 TAEH3 / taehv (https://github.com/madebyollin/taehv)

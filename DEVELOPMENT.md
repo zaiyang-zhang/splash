@@ -700,12 +700,14 @@ variants, so a `:VARIANT` suffix is rejected, and `--revision`,
 - `runtime/engine/`: scheduling, memory admission and reusable request state.
 - `runtime/model/`: target/draft execution and vision.
 - `runtime/ops/` and `runtime/metal/`: operators and Metal kernels.
+- `runtime/video/`: the vendored video engine and `splash video-native`.
 - `install/`: launcher, client configuration and model installation.
 - `dev/`: maintained tests, benchmarks and build/release tools.
 
 Within `server/`, `server.py` owns HTTP and startup; `frontend.py` prepares
 requests and history; `backend.py` owns native request lifecycles. `judgments.py`
-owns finite-choice prompts, validation and typed answer math. `output.py` parses
+owns finite-choice prompts, validation and typed answer math. `videos.py`
+owns video jobs. `output.py` parses
 generated text for both streaming and complete responses, and `constraints.py`
 compiles token constraints. `make architecture-check` prevents lower layers from
 importing the HTTP entry module.
@@ -1051,6 +1053,149 @@ publishes the failing step's cache state or any output, and the rest of the
 batch finishes normally. Prompt chunks that already succeeded keep the blocks
 they committed, exactly as they do for a cancelled request. GPU faults and
 broken engine invariants stay fatal and still mark the runtime unhealthy.
+
+## Video
+
+`splash serve --model MODEL --video-model MiniMaxAI/MiniMax-H3` serves
+MiniMax-H3 video with audio beside the language model: 1344×768 at 24 fps,
+3, 10 or 15 s (73, 243 or 362 frames), in the `turbo` (8 steps) or `default`
+(50 steps) variant. The video engine is the h3 engine, vendored under
+`runtime/video` (`runtime/video/VENDORED`); it is validated on the M5 Pro
+(48 GB) with macOS 27 only, as its int8 MPP kernels need an Apple10 GPU.
+`--accept-video-license` accepts the model's license without the prompt.
+
+### Video installation
+
+`install/videos.py` installs the model, as `install/models.py` installs a
+language model (`--video-model ID prepare|verify|link`), into an assembly of
+kind `h3-video` under `models/.video`. It shows the MiniMax H3 Community
+License Agreement's territory clause, read from the downloaded `LICENSE`, and
+records the acceptance per license text in `models/.video/licenses.json`; the
+agreement excludes the European Union, the United Kingdom, the Republic of
+Korea and the United States from its territory. It resolves and pins the
+sources' commits as installations do ([Revisions](#revisions)):
+MiniMaxAI/MiniMax-H3 (FL2VA: DiT, video and audio VAEs, tokenizer),
+OpenVDN/vdn-minimax-h3 (the VDN-H3 stage checkpoints), madebyollin/taehv
+(TAEH3) and the text encoder, mlx-community/Qwen3-VL-32B-Instruct-4bit. The
+vendored converters (`install/video`) write the engine images once into the
+prepared-weight cache, `video/<key>`, the key hashing the converters and the
+source commits: per variant the int8 Hadamard-rotated DiT blocks, QKFIX,
+io and request preparation tensors and the SSD stream image, then the W8
+video VAE, the audio VAE and TAEH3. `--converted DIR` adopts the images an h3
+checkout converted instead. The assembly links them under `weights/`, with
+`weights/fl2va`, whose adaLN bases request preparation reads, the text
+encoder's checkpoint under `encoder/` and the tokenizer under `tokenizer/`;
+`model.json` records the sources, the acceptance, the variants and the
+images' key. The installer then prepares the text encoder
+(`splash encoder-native ENCODER prepare`).
+
+| Item | Disk |
+| --- | ---: |
+| FL2VA download (DiT, VAEs, tokenizer) | 72 GB |
+| OpenVDN stage checkpoints | 9.4 GB |
+| Text encoder download (4-bit) | 19.6 GB |
+| Converted DiT per variant (blocks 20 GB, stream image 22 GB, prep 1.7 GB) | 43 GB |
+| Converted VAE (W8 and FP16), audio VAE, TAEH3 | 7.1 GB |
+| Prepared text encoder (50 layers) | 14.2 GB |
+
+Both variants take about 210 GB; a Hub cache that already holds the sources
+needs the converted and prepared 107 GB.
+
+### Text encoder
+
+MiniMax-H3 conditions on the unnormalized hidden states after decoder layer
+50 of Qwen3-VL-32B's 64, of every prompt token, tokenized by MiniMax-H3's
+tokenizer without special tokens or chat template. The engine runs that
+encoder itself (`model/QwenEncoder.hpp`, `engine/TextEncoder.hpp`): its
+token table and the 50 layers are prepared like an MLX target, without
+requantization; layers 50–63, the final norm and the head are never prepared
+or read. The layers run the targets' affine prefill kernels; Qwen3-VL's Q/K
+norms, full rotary embedding and causal 64:8 GQA attention run in
+`kernels/prefill/encoder.metal`, over one prompt of up to 2,048 tokens in one
+pass. A request maps the prepared files, encodes and unmaps them, so the
+encoder holds memory only while it runs. Against the MLX reference the
+hidden states differ by kernel rounding only: per-token relative RMS
+1.1e-2 mean, 2.0e-2 max on the 32-token golden prompt, and 1.0e-2 mean,
+5.9e-2 max on a 627-token prompt, which takes 1.7 s.
+
+`HiddenStatesRequest` (native protocol version 8) asks for the states and
+returns them in a `HiddenStates` event. It runs only while no generation
+request is in flight; when the host cannot map the encoder beside the
+language model, even after the engine has dropped its cached prefixes, it
+fails with `insufficient_memory` and the job runner hands the memory over
+first (below) and asks again.
+
+### Video API
+
+The endpoints follow OpenAI's videos API:
+
+| Request | Answer |
+| --- | --- |
+| `POST /v1/videos` | A video object: `id`, `object` `video`, `model`, `status` (`queued`, `in_progress`, `completed`, `failed`), `progress` (0–100), `created_at`, `completed_at`, `size`, `seconds`, `error` |
+| `GET /v1/videos/{id}` | The video object |
+| `GET /v1/videos/{id}/content` | The mp4 (`video/mp4`); `?variant=preview` the TAEH3 preview once it is ready |
+| `DELETE /v1/videos/{id}` | `{"id", "object": "video.deleted", "deleted": true}`; a running job stops at its next step boundary |
+| `GET /v1/videos` | `{"object": "list", "data", "first_id", "last_id", "has_more"}`; `limit` (1–100), `after`, `order` |
+
+A request is JSON: `prompt`, `model` (the video model's ID, optional),
+`seconds` (`"3"`, `"10"` or `"15"`), `size` (`"1344x768"`), and Splash's
+`variant`, `seed` (default 0), `preview` (a TAEH3 preview after denoising,
+default false) and `audio` (default true). `input_reference` and other
+fields are rejected. The object adds `phase`, `variant`, `seed`, `preview`
+(whether the preview is ready) and `phases`, each phase's seconds and peak
+footprint. Up to four jobs queue; more get 503 `video_queue_full`. Finished
+videos are kept within 4 GiB, the oldest first evicted (`expires_at` stays
+null), and are lost with the server, as stored responses are. `/status`
+reports the service under `videos`, and `/v1/models` lists the video model
+with `output_modalities` `["video", "audio"]`.
+
+### Exclusive GPU
+
+From a job's admission until the last job ends, generation requests get 503
+`video_job_running` (529 for `/v1/systemone`), shaped as
+`engine_recovering`; `/health` and `/ready` stay up. A job (`server/videos.py`)
+waits for the requests in flight, then:
+
+1. text: encodes the prompt while the language model is resident;
+2. hands the engine's memory over (`Exclusive`): the engine refuses
+   generation, releases every cached prefix, state and KV extent, and ends
+   its weights' residency, so macOS can reclaim the file-backed weights;
+   `ExclusiveDone` reports what it released and the footprint it kept;
+3. runs `splash video-native` (`runtime/video/VideoJob.hpp`), a process of
+   its own: prep, denoise (each step advances `progress`), preview, decode,
+   audio and mux, reported as JSON events; its exit releases every
+   allocation, and SIGTERM stops it at the next step boundary;
+4. takes the memory back (`Exclusive` release): the weights are wired again
+   and the KV pool grows on demand.
+
+With Qwen3.8-27B serving, the 3 s golden job took 362 s: denoising 317 s
+(eight steps of 39.6 s, eight streamed block slots), decode 28 s. The engine
+kept a 1.6 GB footprint during the job, its file-backed weights unwired, and
+video-native peaked at 7.0 GB. The DiT needs 15.2 GB at 15 s with eight
+streamed slots (4.1 GB of slots and small tensors, 11.0 GB of activations)
+and 32.4 GB resident; the video VAE decodes in a later phase within 4 GB.
+Only the M5 Pro with 48 GB is validated; by these figures a 32 GB Mac would
+hold the 15 s DiT once the language model's memory is handed over, and a
+24 GB Mac would need the handoff before the text encoder and fewer stream
+slots at 15 s.
+
+### Video tests
+
+`make test-engine-metal` runs the encoder kernels against a double-precision
+reference and the video DiT on synthetic weights against the h3 engine's
+hashes, without weight files. With an installation:
+
+| Target | Runs |
+| --- | --- |
+| `test-video-real` | `video-native` on the 3 s golden request: the final latents, prepared inputs, VAE and preview frames byte-identical to `VIDEO_REFERENCES`, resident and streamed, and a cancel at a step boundary (`dev/tests/video_engine_real.py`) |
+| `test-video-http-real` | the golden prompt through `/v1/videos` with `MODEL` serving: refusal, readiness, progress, preview and mp4, and the result against the references (`dev/tests/video_real.py`) |
+
+`SPLASH_VIDEO_HIDDEN_STATES=NPZ` replaces the text encoder with saved hidden
+states, so a job's final latents can be compared with a reference byte for
+byte; `SPLASH_VIDEO_KEEP=1` keeps a job's prompt embedding, prepared inputs,
+final latents and raw frames; `SPLASH_VIDEO_DIR` places the jobs' directory.
+`splash encoder-native ENCODER METALLIB encode TOKENS OUT` writes a prompt's
+hidden states for comparison with the MLX reference.
 
 ## Validate
 

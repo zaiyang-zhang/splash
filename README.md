@@ -56,6 +56,24 @@ Reasoning follows the model default; `"reasoning_effort": "none"` turns it off.
 [Reasoning settings](DEVELOPMENT.md#default-reasoning-effort) ·
 [API details](DEVELOPMENT.md#code-and-api-boundaries)
 
+## Video
+
+On an M5 Pro, Splash can serve [MiniMax-H3](https://huggingface.co/MiniMaxAI/MiniMax-H3)
+video with audio (1344×768, 24 fps, 3, 10 or 15 s) beside the language model,
+through an OpenAI-shaped `/v1/videos` API:
+
+```bash
+splash serve --model mlx-community/Qwen3.8-27B-4bit --video-model MiniMaxAI/MiniMax-H3
+curl http://127.0.0.1:8000/v1/videos -H 'Content-Type: application/json' \
+  -d '{"prompt": "A golden retriever runs along a beach at sunset.", "seconds": "3"}'
+```
+
+A video job holds the GPU until it finishes; chat requests meanwhile get 503
+`video_job_running`. The first serve shows MiniMax-H3's license, which limits
+its use to the license's territory, downloads the weights and converts them
+once. A 3 s clip takes about 6 minutes.
+[Video details](DEVELOPMENT.md#video)
+
 ## Models
 
 Splash supports these model families, with a matching DFlash2 draft selected
@@ -157,4 +175,5 @@ tuning required.
 - [Development](DEVELOPMENT.md): build from source, architecture, tests, and releases.
 - [Issues and feedback](https://github.com/incoai/splash/issues)
 - [Apache-2.0](LICENSE). GGUF kernels include MIT-licensed material from
-  llama.cpp; see [third-party notices](THIRD_PARTY_NOTICES). Model weights keep their own licenses.
+  llama.cpp, and the video engine Apache-2.0 and MIT-licensed material; see
+  [third-party notices](THIRD_PARTY_NOTICES). Model weights keep their own licenses.
