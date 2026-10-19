@@ -1,9 +1,9 @@
 /*
  * h3: MiniMax-H3 on-device engine (M5 Pro, macOS 27) -- C ABI of build/libh3.dylib.
  *
- * One engine per request. The frontend (python -m h3) prepares the request inputs (text encoder, layout, RoPE,
- * adaLN tables, schedule, noise) and hands them over with the request options; the engine owns the device, the
- * weights, the activations and every kernel choice. Phases:
+ * One engine per request. The host supplies the request options and the text-encoder hidden states (Qwen3-VL-32B,
+ * layer 50); the engine owns the device, the weights, the activations and every kernel choice, and returns latents,
+ * frames, the waveform and the mp4. Phases:
  *
  *   h3_create            device, kernel library, request geometry
  *   h3_prep              text hidden states -> layout, RoPE, adaLN tables, refined text, schedule, noise

@@ -1,6 +1,6 @@
 MiniMax-H3 weight converters, vendored
 
-Source: the h3 engine repository, branch native, commit 03881cc, copied
+Source: the h3 engine repository, branch native, commit 222d8c3, copied
 unchanged without history, with the runtime they convert for
 (runtime/video/VENDORED):
 
@@ -13,5 +13,6 @@ working directory and import path, into the prepared-weight cache
 blocks, QKFIX tensors, io tensors and SSD stream image and the request
 preparation's tensors per variant, the W8 video VAE, the audio VAE and TAEH3.
 They read numpy and safetensors only, but for the video VAE's rotary tables,
-which convert_vae.py computes with MLX (H3_MLX_PORT); give the installer an
-interpreter that has MLX with --converter-python.
+which convert_vae.py computes with MLX and the MLX port of MiniMax H3: give
+the installer an interpreter that has MLX with --converter-python and the
+port's checkout in H3_MLX_PORT, which the installer puts on the import path.

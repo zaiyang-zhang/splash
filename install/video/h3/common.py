@@ -1,5 +1,4 @@
-"""Helpers shared by the phases: Hugging Face snapshot paths, bf16 bits, checkpoint shard lookup, phase timer.
-Importing this module puts the MLX port (config.MLX_PORT) on sys.path."""
+"""Helpers shared by the phases and tools: Hugging Face snapshot paths, bf16 bits, phase timer."""
 from __future__ import annotations
 
 import glob
@@ -11,10 +10,7 @@ from pathlib import Path
 
 import numpy as np
 
-from h3.config import H3_REPO, MLX_PORT
-
-if str(MLX_PORT) not in sys.path:
-    sys.path.insert(0, str(MLX_PORT))
+from h3.config import H3_REPO
 
 
 def hf_hub() -> Path:
@@ -70,26 +66,6 @@ def mlx_peak_gb() -> float:
         return 0.0
     import mlx.core as mx
     return mx.get_peak_memory() / 1e9
-
-
-def shard_index(tdir: Path) -> dict[str, str]:
-    return json.load(open(tdir / "model.safetensors.index.json"))["weight_map"]
-
-
-def load_keys(tdir: Path, keys: list[str]) -> dict:
-    """MLX arrays for the given checkpoint keys (mx.load is lazy; only touched tensors are read)."""
-    import mlx.core as mx
-    idx = shard_index(tdir)
-    by_shard: dict[str, list[str]] = {}
-    for k in keys:
-        by_shard.setdefault(str(tdir / idx[k]), []).append(k)
-    out = {}
-    for sh, ks in by_shard.items():
-        d = mx.load(sh)
-        for k in ks:
-            out[k] = d[k]
-        del d
-    return out
 
 
 def save_json(path: Path, obj) -> None:

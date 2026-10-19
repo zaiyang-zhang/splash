@@ -3,8 +3,9 @@
 The engine (build/libh3.dylib) takes the request as a struct (h3/engine.py); every execution choice (kernels, tiles,
 dispatch shapes) is fixed inside it (runtime/engine/DeviceProfile.hpp). Environment variables name paths only:
   H3_WEIGHTS_DIR  weights root (default <repo>/weights): dit-turbo/, dit-default/ (converted DiT + stream.bin),
-                  vae/ (converted video VAE), preview/ (converted TAEH3), vdn/ (OpenVDN stage checkpoints)
-  H3_MLX_PORT     MiniMax-H3 MLX port (text encoder presentation, scheduler, audio VAE, mux)
+                  vae/ (converted video VAE), audio/ (converted audio VAE), preview/ (converted TAEH3),
+                  fl2va -> the FL2VA snapshot (adaLN bases read by h3 prep), vdn/ (OpenVDN, converters only)
+  H3_MLX_PORT     MiniMax-H3 MLX port (request presentation of the standalone text encoder, h3 encode, only)
   H3_GPU_LOCK     shared GPU lock directory
 """
 from __future__ import annotations

@@ -119,11 +119,34 @@ MIT License, Copyright (c) 2024 NVIDIA CORPORATION.
 
 MLX (https://github.com/ml-explore/mlx)
 
-The request preparation's kernels (runtime/metal/kernels/video/prep_prep.metal)
-reproduce the arithmetic of MLX 0.32.1's primitives bit for bit, among them
-its threefry random normal sampling and the K order and register layout of
-its NAX matrix multiplication (steel/gemm/nax.h). MIT License, Copyright (c)
-2023 Apple Inc.
+The request preparation's kernels (runtime/metal/kernels/video/prep_prep.metal,
+runtime/video/ops/PrepOps.mm, runtime/video/model/Prep.mm) reproduce the
+arithmetic of MLX 0.32.1's primitives, so the prepared inputs match MLX's bit
+for bit: the fragment order of its NAX GEMM and attention kernels, its wide
+GEMV, RMS norm and sigmoid, and the threefry2x32 key sequence and erfinv
+polynomial of its random.normal. No MLX code is linked or loaded.
+
+MIT License
+
+Copyright © 2023 Apple Inc.
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
 
 
 TAEH3 / taehv (https://github.com/madebyollin/taehv)

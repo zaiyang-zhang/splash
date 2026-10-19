@@ -1,8 +1,8 @@
 MiniMax-H3 video engine (h3), vendored
 
 Source: the h3 engine repository, branch native, commit
-03881cc ("Synthetic-weights mode: h3 bench --synthetic ..."), on top of main
-8c4a054. Plain copy, without its git history, by dev/tools/vendor_video.sh.
+222d8c3 (after "Synthetic-weights mode" and the native prep, audio VAE and
+mp4 writer), on top of main 8c4a054. Plain copy, without its git history, by dev/tools/vendor_video.sh.
 
 What came from where:
 
