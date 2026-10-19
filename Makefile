@@ -36,19 +36,23 @@ BUILD := build
 TARGET := $(BUILD)/splash
 METAL_BUILD := $(BUILD)/metal
 # Production kernels are grouped by execution phase under
-# runtime/metal/kernels/{prefill,decode,shared}; every .metal file there is
-# compiled into the metallib. Templates both phases instantiate live in
-# kernels/common/, the host/shader contract in runtime/metal/abi/.
+# runtime/metal/kernels/{prefill,decode,shared}, and the video engine's
+# (runtime/video) under kernels/video; every .metal file there is compiled
+# into the metallib. Templates both phases instantiate live in
+# kernels/common/ (kernels/video/common/ for video), the host/shader contract
+# in runtime/metal/abi/ (abi/video/).
 PRODUCTION_KERNEL_SOURCES := $(sort $(wildcard \
 	runtime/metal/kernels/prefill/*.metal \
 	runtime/metal/kernels/decode/*.metal \
-	runtime/metal/kernels/shared/*.metal))
+	runtime/metal/kernels/shared/*.metal \
+	runtime/metal/kernels/video/*.metal))
 PRODUCTION_KERNEL_NAMES := \
 	$(patsubst runtime/metal/kernels/%.metal,%,$(PRODUCTION_KERNEL_SOURCES))
 PRODUCTION_AIRS := $(addprefix $(METAL_BUILD)/, \
 	$(addsuffix .air,$(PRODUCTION_KERNEL_NAMES)))
 KERNEL_HEADERS := $(sort $(wildcard runtime/metal/abi/*.h \
-	runtime/metal/kernels/common/*.h))
+	runtime/metal/kernels/common/*.h runtime/metal/abi/video/*.h \
+	runtime/metal/kernels/video/common/*.h))
 # Placement-sparse support became queryable in macOS 26.4
 # (MTLDevice.supportsPlacementSparse). The engine refuses older systems at
 # startup; every binary and metallib records the same floor.
@@ -59,6 +63,11 @@ PROD_METALFLAGS := -std=metal4.0 -O3 -Wall -Wextra -Werror -Iruntime \
 ENGINE_CXXFLAGS := -std=c++20 -O3 -Wall -Wextra -Werror -Iruntime -I$(BUILD)/engine \
 	$(MACOS_TARGET_FLAG)
 ENGINE_OBJCXXFLAGS := $(ENGINE_CXXFLAGS) -fobjc-arc
+# The video engine's host arithmetic (Euler update, latent de-normalisation)
+# compiles op by op, as numpy computes it, so its latents and frames stay
+# byte-identical to the references (runtime/video/VENDORED).
+VIDEO_CXXFLAGS := $(ENGINE_CXXFLAGS) -ffp-contract=off
+VIDEO_OBJCXXFLAGS := $(VIDEO_CXXFLAGS) -fobjc-arc
 LIB := $(BUILD)/splash.metallib
 .PHONY: all clean force-build-identity install _install \
 	install-environment _install-environment \
@@ -204,6 +213,7 @@ shell-quote = '$(subst ','"'"',$(1))'
 CONFIG_DIGEST := $(shell printf '%s\0' $(BUILD_RULES_DIGEST) \
 	$(call shell-quote,$(CXX)) $(call shell-quote,$(ENGINE_CXXFLAGS)) \
 	$(call shell-quote,$(ENGINE_OBJCXXFLAGS)) $(call shell-quote,$(ENGINE_DEPFLAGS)) \
+	$(call shell-quote,$(VIDEO_OBJCXXFLAGS)) \
 	$(call shell-quote,$(ENGINE_LINKFLAGS)) $(call shell-quote,$(AR)) \
 	$(call shell-quote,$(METAL)) $(call shell-quote,$(PROD_METALFLAGS)) \
 	$(call shell-quote,$(METALLIB)) | shasum -a 256 | cut -c1-16)
@@ -222,6 +232,7 @@ BUILD_ID_CONSTANT_ARGS = \
 	--constant 'engine_cxxflags=$(ENGINE_CXXFLAGS)' \
 	--constant 'engine_objcxxflags=$(ENGINE_OBJCXXFLAGS)' \
 	--constant 'engine_linkflags=$(ENGINE_LINKFLAGS)' \
+	--constant 'video_objcxxflags=$(VIDEO_OBJCXXFLAGS)' \
 	--constant 'production_metalflags=$(PROD_METALFLAGS)'
 ENGINE_MAIN_OBJECT := $(ENGINE_BUILD)/main.o
 ENGINE_METAL_RUNTIME_OBJECT := $(ENGINE_BUILD)/metal/MetalBackend.o
@@ -287,9 +298,18 @@ ENGINE_OBJECTS := \
 	$(patsubst runtime/%.cpp,$(ENGINE_BUILD)/%.o,$(ENGINE_CPP_SOURCES)) \
 	$(patsubst runtime/%.mm,$(ENGINE_BUILD)/%.o,$(ENGINE_MM_SOURCES)) \
 	$(ENGINE_METAL_RUNTIME_OBJECT)
+# The video engine has an archive of its own: its objects share basenames
+# with the engine's (Engine.o, MetalBackend.o), which one archive cannot hold.
+VIDEO_LIBRARY := $(ENGINE_BUILD)/libsplash-video.a
+VIDEO_CPP_SOURCES := $(sort $(wildcard runtime/video/*.cpp runtime/video/*/*.cpp))
+VIDEO_MM_SOURCES := $(sort $(wildcard runtime/video/*.mm runtime/video/*/*.mm))
+VIDEO_CPP_OBJECTS := $(patsubst runtime/%.cpp,$(ENGINE_BUILD)/%.o,$(VIDEO_CPP_SOURCES))
+VIDEO_MM_OBJECTS := $(patsubst runtime/%.mm,$(ENGINE_BUILD)/%.o,$(VIDEO_MM_SOURCES))
+VIDEO_OBJECTS := $(VIDEO_CPP_OBJECTS) $(VIDEO_MM_OBJECTS)
 PRODUCTION_CONFIG_TARGETS := $(ENGINE_OBJECTS) $(ENGINE_MAIN_OBJECT) \
-	$(ENGINE_LIBRARY) $(PRODUCTION_AIRS) $(LIB) $(TARGET)
-ENGINE_DEPFILES := $(ENGINE_OBJECTS:.o=.d) $(ENGINE_MAIN_OBJECT:.o=.d)
+	$(ENGINE_LIBRARY) $(VIDEO_OBJECTS) $(VIDEO_LIBRARY) $(PRODUCTION_AIRS) $(LIB) $(TARGET)
+ENGINE_DEPFILES := $(ENGINE_OBJECTS:.o=.d) $(ENGINE_MAIN_OBJECT:.o=.d) \
+	$(VIDEO_OBJECTS:.o=.d)
 
 -include $(ENGINE_DEPFILES)
 
@@ -345,10 +365,23 @@ $(ENGINE_LIBRARY): $(ENGINE_OBJECTS)
 	$(RM) $@
 	$(RUN_CONFIGURED) $(AR) rcs $@ $(BUILD_INPUTS)
 
-$(TARGET): $(ENGINE_MAIN_OBJECT) $(ENGINE_LIBRARY) $(LIB) \
+$(VIDEO_CPP_OBJECTS): $(ENGINE_BUILD)/%.o: runtime/%.cpp
+	@mkdir -p $(dir $@)
+	$(RUN_CONFIGURED) $(CXX) $(VIDEO_CXXFLAGS) $(ENGINE_DEPFLAGS) -c $< -o $@
+
+$(VIDEO_MM_OBJECTS): $(ENGINE_BUILD)/%.o: runtime/%.mm
+	@mkdir -p $(dir $@)
+	$(RUN_CONFIGURED) $(CXX) $(VIDEO_OBJCXXFLAGS) $(ENGINE_DEPFLAGS) -c $< -o $@
+
+$(VIDEO_LIBRARY): $(VIDEO_OBJECTS)
+	@mkdir -p $(dir $@)
+	$(RM) $@
+	$(RUN_CONFIGURED) $(AR) rcs $@ $(BUILD_INPUTS)
+
+$(TARGET): $(ENGINE_MAIN_OBJECT) $(ENGINE_LIBRARY) $(VIDEO_LIBRARY) $(LIB) \
 		| $(BUILD)
 	$(RUN_CONFIGURED) $(CXX) $(ENGINE_OBJCXXFLAGS) $(ENGINE_MAIN_OBJECT) $(ENGINE_LIBRARY) \
-		$(ENGINE_LINKFLAGS) -o $@
+		$(VIDEO_LIBRARY) $(ENGINE_LINKFLAGS) -o $@
 
 clean:
 	rm -rf $(BUILD)

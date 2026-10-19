@@ -1,0 +1,39 @@
+MiniMax-H3 video engine (h3), vendored
+
+Source: the h3 engine repository, branch main, commit
+8c4a054674787175d293232dbc0c884eceb9cad4 ("DEVELOPMENT.md"). Plain copy, without
+its git history.
+
+What came from where:
+
+  h3 runtime/engine/*                 -> runtime/video/engine/
+  h3 runtime/model/*                  -> runtime/video/model/
+  h3 runtime/ops/*                    -> runtime/video/ops/
+  h3 runtime/metal/MetalBackend.*     -> runtime/video/metal/
+  h3 include/h3/h3.h (C ABI)          -> runtime/video/abi/h3.h
+  h3 runtime/metal/abi/*              -> runtime/metal/abi/video/
+  h3 runtime/metal/kernels/common/*   -> runtime/metal/kernels/video/common/
+  h3 runtime/metal/kernels/GROUP/F    -> runtime/metal/kernels/video/GROUP_F
+                                         (GROUP: dit, vae, preview; shared/F -> F)
+
+The only edits are the include paths, rewritten for these locations
+("engine/" -> "video/engine/", "model/" -> "video/model/", "ops/" -> "video/ops/",
+"metal/MetalBackend.hpp" -> "video/metal/MetalBackend.hpp", "metal/abi/" ->
+"metal/abi/video/", "metal/kernels/common/" -> "metal/kernels/video/common/",
+"h3/h3.h" -> "video/abi/h3.h"). Code and kernel arithmetic are unchanged.
+
+Splash's own files beside the vendored tree: VideoJob.{hpp,mm} (the
+`splash video-native` process the server runs per job) and this note.
+
+Build: the kernels compile with Splash's production Metal flags into
+splash.metallib (the video kernel group), the host code with Splash's flags
+plus -ffp-contract=off, as h3 builds it, into build/engine/libsplash-video.a.
+With these flags the 3 s golden request's final latents, video VAE frames and
+TAEH3 preview frames are byte-identical to h3's references (dev/tests/video).
+
+Licenses: THIRD_PARTY_NOTICES (OpenVDN vdn-minimax-h3, Apache-2.0; TAEH3,
+MIT; FastVideo, Apache-2.0). No model weights are vendored; the installer
+downloads them under the MiniMax H3 Community License Agreement.
+
+To update: copy the same directories from a newer h3 commit, apply the include
+rewrite (dev/tools/vendor_video.sh), rebuild and run make test-video.

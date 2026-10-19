@@ -5,6 +5,7 @@
 #include "engine/Status.hpp"
 #include "model/Model.hpp"
 #include "model/ModelDescriptor.hpp"
+#include "video/VideoJob.hpp"
 
 #include <dispatch/dispatch.h>
 #include <mach-o/dyld.h>
@@ -460,6 +461,8 @@ int main(int argc, char **argv) {
     try {
       if (argc == 2 && std::string_view(argv[1]) == "device-check")
         return splash::checkDevice();
+      if (argc >= 2 && std::string_view(argv[1]) == "video-native")
+        return splash::video::runVideoJob(argc, argv);
       splash::NativeArguments arguments = splash::parseArguments(argc, argv);
       return splash::runNative(arguments);
     } catch (const splash::UsageError &error) {
