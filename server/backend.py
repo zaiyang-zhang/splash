@@ -317,6 +317,11 @@ class NativeBackend:
             return False
         return True
 
+    def idle(self):
+        """Whether no request is in flight in the engine."""
+        with self.lock:
+            return not self.active
+
     def is_ready(self):
         if not self.can_submit():
             return False

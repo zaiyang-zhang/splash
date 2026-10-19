@@ -23,7 +23,8 @@
 // Events are JSON lines on stdout, each with the process's footprint and its
 // peak: "ready", "phase" (started/completed), "step" (denoising progress),
 // then "done"; an error exits 1 after an "error" event, cancellation exits
-// kVideoCancelledExit after a "cancelled" event.
+// kVideoCancelledExit after a "cancelled" event. The engine's own log lines
+// (H3_LOG) go to stderr.
 
 namespace splash::video {
 

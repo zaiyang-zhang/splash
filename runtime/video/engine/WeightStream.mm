@@ -31,7 +31,11 @@ Status WeightStream::open(metal::MetalBackend &backend, const std::string &image
   for (Slot &slot : stream->slots_) {
     for (int t = 0; t < kTensors; ++t) H3_TRY(backend.allocate(h.tensorBytes[t], slot.tensor[t], "stream slot"));
     slot.ready = dispatch_semaphore_create(0);
-    slot.free = dispatch_semaphore_create(1);
+    // Created at 0 and signalled once: libdispatch traps on disposing a
+    // semaphore below its creation value, which a slot the reader holds at
+    // release time is (Splash patch, runtime/video/VENDORED).
+    slot.free = dispatch_semaphore_create(0);
+    dispatch_semaphore_signal(slot.free);
   }
   stream->io_ = dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0);
   out = std::move(stream);
@@ -91,7 +95,8 @@ Status WeightStream::start(metal::MetalBackend &backend, int blocks, const std::
     for (Slot &slot : qkfixSlots_) {
       H3_TRY(backend.allocate(size_t(H3_DIT_QKV) * H3_DIT_HIDDEN * 2, slot.tensor[0], "stream QKFIX slot"));
       slot.ready = dispatch_semaphore_create(0);
-      slot.free = dispatch_semaphore_create(1);
+      slot.free = dispatch_semaphore_create(0);
+      dispatch_semaphore_signal(slot.free);
     }
   }
   started_ = true;

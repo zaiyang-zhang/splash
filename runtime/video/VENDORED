@@ -22,6 +22,12 @@ The only edits are the include paths, rewritten for these locations
 "metal/abi/video/", "metal/kernels/common/" -> "metal/kernels/video/common/",
 "h3/h3.h" -> "video/abi/h3.h"). Code and kernel arithmetic are unchanged.
 
+One local patch, to send upstream: WeightStream.mm creates each slot's
+`free` semaphore at 0 and signals it once instead of creating it at 1.
+libdispatch traps (SIGTRAP, "Semaphore object deallocated while in use")
+when a semaphore is disposed below its creation value, which a slot the SSD
+reader holds is when the DiT is released after a streamed run.
+
 Splash's own files beside the vendored tree: VideoJob.{hpp,mm} (the
 `splash video-native` process the server runs per job) and this note.
 

@@ -308,6 +308,8 @@ class Frontend:
         self.preparation_waiting = 0
         self.response_store = ResponseStore()
         self.thinking_codec = thinking_codec
+        # The video service (server/videos.py) when a video model is served.
+        self.videos = None
 
     def accepts_model(self, model):
         return isinstance(model, str) and model in self.model_names
@@ -333,6 +335,8 @@ class Frontend:
         status["image_cache"] = self.images.stats()
         status["tokenizer_cache"] = self.prompt_tokenizer.stats()
         status["latency"] = self.latencies.snapshot()
+        if self.videos is not None:
+            status["videos"] = self.videos.stats()
         return status
 
     def _prepare_images(self, messages, *, check_context=True):

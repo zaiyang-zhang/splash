@@ -30,6 +30,9 @@ public:
 };
 
 std::atomic<bool> gCancelled{false};
+// The event stream: the process's stdout, which the engine's own log lines
+// (H3_LOG, written to stdout) leave for stderr.
+FILE *gEvents = stdout;
 
 void requestCancel(int) { gCancelled.store(true, std::memory_order_relaxed); }
 
@@ -71,8 +74,8 @@ void emit(std::string_view event, const std::string &fields = {}) {
   std::string line = "{\"event\": " + quoted(event) + (fields.empty() ? "" : ", " + fields) +
                      ", \"footprint_bytes\": " + std::to_string(f.current) +
                      ", \"peak_footprint_bytes\": " + std::to_string(f.peak) + "}\n";
-  fputs(line.c_str(), stdout);
-  fflush(stdout);
+  fputs(line.c_str(), gEvents);
+  fflush(gEvents);
 }
 
 std::string member(std::string_view name, const std::string &value) { return quoted(name) + ": " + value; }
@@ -360,6 +363,10 @@ void run(const Options &options) {
 } // namespace
 
 int runVideoJob(int argc, char **argv) {
+  const int events = dup(STDOUT_FILENO);
+  if (events >= 0 && dup2(STDERR_FILENO, STDOUT_FILENO) >= 0) {
+    if (FILE *stream = fdopen(events, "w")) gEvents = stream;
+  }
   struct sigaction action {};
   action.sa_handler = requestCancel;
   sigemptyset(&action.sa_mask);

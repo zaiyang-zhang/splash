@@ -119,6 +119,35 @@ test-release-real: preflight $(TARGET) agent-preflight verify-build-identity
 	TRANSFORMERS_VERBOSITY=error $(PYTHON) dev/tests/agent_real.py $(AGENT_ARGS) \
 		--http-smoke
 
+# The video model (DEVELOPMENT.md, Video). VIDEO_REFERENCES is a directory of
+# the 3 s golden request's prep/, final.npz, frames.npy and
+# preview_frames.npy; VIDEO_FRONTEND an h3 checkout with its environment.
+VIDEO_MODEL ?= MiniMaxAI/MiniMax-H3
+VIDEO_REFERENCES ?=
+VIDEO_FRONTEND ?=
+VIDEO_ROOT = $(shell $(PYTHON) install/videos.py --video-model "$(VIDEO_MODEL)" link)
+
+.PHONY: test-video-real test-video-http-real
+test-video-real: $(TARGET)
+	@test -n "$(VIDEO_REFERENCES)" || { \
+		echo "error: set VIDEO_REFERENCES to the video engine's reference directory" >&2; \
+		exit 1; \
+	}
+	$(PYTHON) dev/tests/video_engine_real.py --weights "$(VIDEO_ROOT)/weights" \
+		--references "$(VIDEO_REFERENCES)" --output build/release/video-engine.json
+
+test-video-http-real: preflight $(TARGET)
+	@test -n "$(VIDEO_REFERENCES)" || { \
+		echo "error: set VIDEO_REFERENCES to the video engine's reference directory" >&2; \
+		exit 1; \
+	}
+	TRANSFORMERS_VERBOSITY=error $(PYTHON) dev/tests/video_real.py --model "$(MODEL)" \
+		--package "$(MODEL_ROOT)" --video-root "$(VIDEO_ROOT)" \
+		$(if $(VIDEO_FRONTEND),--video-frontend "$(VIDEO_FRONTEND)") \
+		--reference "$(VIDEO_REFERENCES)/final.npz" \
+		--reference-frames "$(VIDEO_REFERENCES)/frames.npy" \
+		--output build/release/video-http.json
+
 # BASELINE is a checkout whose build/ holds another build's splash.metallib
 # and engine-tests/backend-benchmark: this build is compared with it on this
 # machine in ABBA order (dev/benchmarks/backend_regression.py). Without it,

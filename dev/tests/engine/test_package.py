@@ -25,6 +25,8 @@ class PackageTests(unittest.TestCase):
             for folder, names in (
                 ("install", package.INSTALL_FILES),
                 ("install/completions", package.COMPLETION_FILES),
+                ("install/video", package.VIDEO_CONVERTER_FILES),
+                ("install/video/h3", package.VIDEO_CONVERTER_MODULES),
                 ("server", package.SERVER_FILES),
                 ("build", ("splash", "splash.metallib")),
             ):
@@ -85,6 +87,8 @@ class PackageTests(unittest.TestCase):
             stage.mkdir()
             for folder, names in (
                 ("install", package.INSTALL_FILES),
+                ("install/video", package.VIDEO_CONVERTER_FILES),
+                ("install/video/h3", package.VIDEO_CONVERTER_MODULES),
                 ("server", package.SERVER_FILES),
                 ("build", ("splash", "splash.metallib")),
             ):
@@ -125,7 +129,7 @@ class PackageTests(unittest.TestCase):
             )
             self.assertEqual(
                 {p.name for p in (stage / "install").iterdir()},
-                {*package.INSTALL_FILES, "completions"},
+                {*package.INSTALL_FILES, "completions", "video"},
             )
             shipped = stage / "install/completions"
             self.assertEqual({p.name for p in shipped.iterdir()}, completion_names)

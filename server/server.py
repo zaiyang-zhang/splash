@@ -65,6 +65,7 @@ if __package__:
         validate_tool_calls,
     )
     from .thinking import ThinkingCodec, ThinkingKeyError, load_thinking_key
+    from .videos import H3Pipeline, VideoInstallation, VideoService
 else:
     import images as image_input
     import json_codec
@@ -108,6 +109,7 @@ else:
         validate_tool_calls,
     )
     from thinking import ThinkingCodec, ThinkingKeyError, load_thinking_key
+    from videos import H3Pipeline, VideoInstallation, VideoService
 
     import runtime as engine_runtime
 
@@ -461,7 +463,13 @@ class FrontendHandler(BaseHTTPRequestHandler):
             self._json(200, {"status": "ok"})
             return
         if path == "/ready":
-            ready = self.app.backend.is_ready()
+            # A video job holds the GPU and pages the language model out;
+            # the server stays ready while its engine is alive.
+            videos = self.app.videos
+            if videos is not None and videos.holds_gpu():
+                ready = self.app.backend.can_submit()
+            else:
+                ready = self.app.backend.is_ready()
             self._json(
                 200 if ready else 503,
                 {"status": "ready" if ready else "unavailable"},
@@ -476,6 +484,9 @@ class FrontendHandler(BaseHTTPRequestHandler):
                 prometheus_metrics(self.server.status()).encode(),
                 "text/plain; version=0.0.4; charset=utf-8",
             )
+            return
+        if path == "/v1/videos" or path.startswith("/v1/videos/"):
+            self._video_get(path)
             return
         response_match = re.fullmatch(r"/v1/responses/(resp_[A-Za-z0-9_]+)", path)
         if response_match:
@@ -501,6 +512,23 @@ class FrontendHandler(BaseHTTPRequestHandler):
                 }
                 for name in self.app.model_names
             ]
+            if self.app.videos is not None:
+                models += [
+                    {
+                        "id": name,
+                        "object": "model",
+                        "created": 0,
+                        "owned_by": "splash",
+                        "input_modalities": ["text"],
+                        "output_modalities": ["video", "audio"],
+                        **(
+                            {"root": self.app.videos.model}
+                            if name != self.app.videos.model
+                            else {}
+                        ),
+                    }
+                    for name in self.app.videos.model_names
+                ]
             if model_path == "/v1/models":
                 # TypeSafe SDK compatibility: models.list() reads "models" entries.
                 typed = [
@@ -526,6 +554,13 @@ class FrontendHandler(BaseHTTPRequestHandler):
 
     def do_DELETE(self):
         path = self.path.partition("?")[0]
+        video_match = re.fullmatch(r"/v1/videos/(video_[0-9a-f]+)", path)
+        if video_match is not None:
+            try:
+                self._json(200, self._videos().delete(video_match.group(1)))
+            except APIError as error:
+                self._safe_error(error)
+            return
         response_match = re.fullmatch(r"/v1/responses/(resp_[A-Za-z0-9_]+)", path)
         if response_match is None:
             self._safe_error(APIError(404, "not found", "not_found"))
@@ -549,7 +584,12 @@ class FrontendHandler(BaseHTTPRequestHandler):
         # turn a supported endpoint into an unknown one.
         path = self.path.partition("?")[0]
         count_tokens = path == "/v1/messages/count_tokens"
-        prompt_only = count_tokens or path in ("/tokenize", "/apply-template")
+        # Video jobs are admitted here and run on their own worker.
+        prompt_only = count_tokens or path in (
+            "/tokenize",
+            "/apply-template",
+            "/v1/videos",
+        )
         anthropic = path == "/v1/messages" or count_tokens
         systemone = path == "/v1/systemone"
         completions = path == "/v1/completions"
@@ -563,8 +603,21 @@ class FrontendHandler(BaseHTTPRequestHandler):
             "/apply-template",
             "/v1/judgments",
             "/v1/systemone",
+            "/v1/videos",
         ):
             self._safe_error(APIError(404, "not found", "not_found"))
+            return
+        videos = self.app.videos
+        if not prompt_only and videos is not None and videos.holds_gpu():
+            self._safe_error(
+                APIError(
+                    529 if systemone else 503,
+                    "a video job holds the GPU; retry when it completes",
+                    "video_job_running",
+                ),
+                anthropic,
+                log=False,
+            )
             return
         if not prompt_only and not self.app.backend.can_submit():
             failure = self.app.backend.engine_error
@@ -610,6 +663,9 @@ class FrontendHandler(BaseHTTPRequestHandler):
                         [judgments.detail(["timeout"], error.message)]
                     ) from error
                 raise
+            if path == "/v1/videos":
+                self._json(200, self._videos().submit(body))
+                return
             if path == "/tokenize":
                 self._json(200, {"tokens": self.app.tokenize(body, deadline=deadline)})
                 return
@@ -758,6 +814,33 @@ class FrontendHandler(BaseHTTPRequestHandler):
                 self._body_reservation = None
             admission.release()
             self.app.latencies.observe("http_request", time.monotonic() - started_at)
+
+    def _videos(self):
+        if self.app.videos is None:
+            raise APIError(404, "this server serves no video model", "not_found")
+        return self.app.videos
+
+    def _video_get(self, path):
+        query = dict(
+            pair.partition("=")[::2]
+            for pair in self.path.partition("?")[2].split("&")
+            if pair
+        )
+        try:
+            videos = self._videos()
+            if path == "/v1/videos":
+                self._json(200, videos.list({k: unquote(v) for k, v in query.items()}))
+                return
+            match = re.fullmatch(r"/v1/videos/(video_[0-9a-f]+)(/content)?", path)
+            if match is None:
+                raise APIError(404, "not found", "not_found")
+            if match.group(2):
+                variant = unquote(query.get("variant", "video"))
+                self._send(200, videos.content(match.group(1), variant), "video/mp4")
+            else:
+                self._json(200, videos.get(match.group(1)))
+        except APIError as error:
+            self._safe_error(error)
 
     def _judgment_complete(self, job, row):
         result = None
@@ -2300,6 +2383,19 @@ def parse_args(argv=None):
     parser.add_argument("--no-webui", action="store_true")
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--binary", default=str(ROOT / "build" / "splash"))
+    parser.add_argument(
+        "--video-root",
+        type=Path,
+        default=None,
+        help="an h3-video installation to serve /v1/videos from (install/videos.py)",
+    )
+    parser.add_argument(
+        "--video-frontend",
+        type=Path,
+        default=None,
+        help="h3 checkout whose environment prepares requests and decodes audio "
+        "until the vendored engine does (runtime/video/VENDORED)",
+    )
     args = parser.parse_args(argv)
     if (
         args.default_reasoning_effort is not None
@@ -2350,6 +2446,8 @@ def _native_command(args):
         command.extend(("--kv-format", args.kv_format))
     if args.decode_share is not None:
         command.extend(("--decode-share", str(args.decode_share)))
+    if args.video_root is not None:
+        command.extend(("--video", str(args.video_root)))
     return command
 
 
@@ -2435,6 +2533,28 @@ def main():
             default_reasoning_effort=args.default_reasoning_effort,
             vision=readiness.vision,
         )
+        if args.video_root is not None:
+            if not readiness.video:
+                raise engine_runtime.EngineUnhealthy(
+                    "native runtime did not announce its video model"
+                )
+            installation = VideoInstallation.read(args.video_root)
+            pipeline = H3Pipeline(
+                installation,
+                runtime,
+                backend,
+                binary=args.binary,
+                metallib=Path(args.binary).with_name("splash.metallib"),
+                frontend=args.video_frontend,
+                hidden_states_override=os.environ.get("SPLASH_VIDEO_HIDDEN_STATES"),
+                keep_intermediates=os.environ.get("SPLASH_VIDEO_KEEP") == "1",
+            )
+            app.videos = VideoService(
+                pipeline,
+                installation.model,
+                root=os.environ.get("SPLASH_VIDEO_DIR"),
+            )
+            print_status(f"Video · {installation.model}")
         server.app = app
         server.server_activate()
         address = f"http://{args.host}:{server.server_port}"
@@ -2469,6 +2589,9 @@ def main():
             signal.SIG_IGN if runtime is None else lambda *_: runtime.kill(),
         )
         try:
+            if server is not None and getattr(server, "app", None) is not None:
+                if server.app.videos is not None:
+                    server.app.videos.close()
             if backend is not None:
                 print_status("Stopping · releasing engine resources")
                 backend.close()

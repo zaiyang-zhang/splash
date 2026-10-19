@@ -34,3 +34,100 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
+
+
+MiniMax-H3 video engine (runtime/video, the video kernel group, install/video)
+
+The video engine runs MiniMax H3 (https://huggingface.co/MiniMaxAI/MiniMax-H3)
+and derivatives of it. No model weights are part of Splash: install/videos.py
+downloads them from their publishers after the user accepts their licenses.
+MiniMax H3, and the VDN-H3 weights derived from it, are licensed under the
+MiniMax H3 Community License Agreement, Copyright (c) 2026 MiniMax. All Rights
+Reserved. The agreement grants rights only within its Applicable Territory,
+which excludes the European Union, the United Kingdom, the Republic of Korea
+and the United States of America, and incorporates an Acceptable Use Policy;
+it is published with the model at the URL above.
+
+
+OpenVDN vdn-minimax-h3 (https://huggingface.co/OpenVDN/vdn-minimax-h3)
+
+The window-softmax attention and the linear branch of the video DiT
+(runtime/metal/kernels/video/dit_window_attention.metal,
+dit_linear_branch.metal, runtime/video/engine/WindowTable.mm) and the DiT
+converter (install/video/convert_dit.py) implement VDN-H3's hybrid attention
+from OpenVDN's code, licensed under the Apache License, Version 2.0
+(http://www.apache.org/licenses/LICENSE-2.0). Its NOTICE:
+
+VDN — Video DeltaNet
+Copyright 2026 the VDN authors.
+
+This repository contains the VDN-H3 training and inference code, licensed under the
+Apache License, Version 2.0 (see LICENSE). It does not contain model weights.
+
+--------------------------------------------------------------------------------
+MiniMax H3
+--------------------------------------------------------------------------------
+
+MiniMax H3 is licensed under the MiniMax H3 Community License Agreement,
+Copyright © 2026 MiniMax. All Rights Reserved.
+
+MiniMax H3 is not distributed in this repository. The VDN-H3 weights, which are a
+derivative of MiniMax H3, are distributed separately at
+https://huggingface.co/OpenVDN/vdn-minimax-h3 under the MiniMax H3
+Community License Agreement. A verbatim copy of that agreement is included here at
+licenses/MiniMax-H3-Community-License-Agreement.txt.
+
+Running the code in this repository means running MiniMax H3 or a derivative of it,
+and is therefore subject to that agreement. The agreement grants rights only within
+its "Applicable Territory", defined as worldwide excluding the European Union, the
+United Kingdom, the Republic of Korea, and the United States of America, and states
+that use outside the Applicable Territory is not authorized. It also incorporates an
+Acceptable Use Policy. Read it in full before downloading or running MiniMax H3 or
+any derivative of it.
+
+
+FastVideo (https://github.com/hao-ai-lab/FastVideo)
+
+The TAEH3 decoder structure of the preview kernels
+(runtime/metal/kernels/video/preview_*.metal,
+runtime/video/ops/PreviewDecoder.mm) and of install/video/convert_preview.py
+(MemBlock state, TGrow, frame drop, input and output transforms) follows
+FastVideo's TAEH3 port (fastvideo/mlx_runtime/minimax_h3_taeh3.py). Licensed
+under the Apache License, Version 2.0
+(http://www.apache.org/licenses/LICENSE-2.0).
+
+
+minimax-h3-mlx (https://github.com/PipeNetwork/minimax-h3-mlx)
+
+The video VAE tile plan of runtime/video/model/Geometry.cpp and the rotary
+tables of install/video/convert_vae.py follow this MLX port of MiniMax H3,
+which the converter also imports. Licensed under the Apache License, Version
+2.0 (http://www.apache.org/licenses/LICENSE-2.0).
+
+
+TAEH3 / taehv (https://github.com/madebyollin/taehv)
+
+The preview decoder runs the TAEH3 tiny decoder, whose weights the installer
+downloads and install/video/convert_preview.py converts.
+
+MIT License
+
+Copyright (c) 2025 Ollin Boer Bohan
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.

@@ -152,6 +152,25 @@ def _ensure_installed(selection):
         raise LauncherError("model download or verification failed")
 
 
+def _ensure_video_installed(args):
+    """The video model's installation (install/videos.py), installed or
+    verified now: its license is acknowledged before anything downloads."""
+    command = [
+        str(paths.PYTHON),
+        str(ROOT / "install/videos.py"),
+        "--models",
+        str(paths.MODELS),
+        "--video-model",
+        args.video_model,
+        "prepare",
+    ]
+    if args.accept_video_license:
+        command.insert(-1, "--accept-license")
+    if _run_held(command, cwd=ROOT):
+        raise LauncherError("video model installation failed")
+    return (paths.MODELS / ".video" / args.video_model).resolve(strict=True)
+
+
 def _serve_lock_owner(lock):
     try:
         lock.seek(0)
@@ -243,6 +262,7 @@ def serve(args):
             draft_model=args.draft_model,
         )
         _ensure_installed(selection)
+        video_root = _ensure_video_installed(args) if args.video_model else None
         # A concurrent install may advance the selection link. Keep this
         # process's tokenizer, draft and target on one immutable assembly,
         # held until the server exits.
@@ -294,6 +314,10 @@ def serve(args):
             command.append("--no-webui")
         for host in args.allowed_host:
             command.extend(["--allowed-host", host])
+        if video_root is not None:
+            command.extend(["--video-root", str(video_root)])
+            if args.video_frontend:
+                command.extend(["--video-frontend", args.video_frontend])
         environment = dict(
             os.environ, PYTHONUNBUFFERED="1", TRANSFORMERS_VERBOSITY="error"
         )
@@ -655,6 +679,22 @@ def parse_args(argv=None):
         help="API key (default: SPLASH_API_KEY environment variable)",
     )
     server.add_argument("--no-webui", action="store_true", help="disable the chat page")
+    server.add_argument(
+        "--video-model",
+        type=model_artifacts.parse_model_id,
+        help="also serve /v1/videos with this video model, e.g. MiniMaxAI/MiniMax-H3 "
+        "(validated on the M5 Pro only)",
+    )
+    server.add_argument(
+        "--accept-video-license",
+        action="store_true",
+        help="accept the video model's license without the interactive prompt",
+    )
+    server.add_argument(
+        "--video-frontend",
+        help="h3 checkout whose environment prepares video requests until the "
+        "engine does (DEVELOPMENT.md, Video)",
+    )
     for name in clients.INSTALL_URLS:
         commands.add_parser(name, help=f"connect {name} to the running server")
     args = parser.parse_args(argv)

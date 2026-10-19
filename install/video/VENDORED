@@ -1,0 +1,15 @@
+MiniMax-H3 weight converters, vendored
+
+Source: the h3 engine repository, branch main, commit
+8c4a054674787175d293232dbc0c884eceb9cad4, copied unchanged without history:
+
+  h3 tools/convert_dit.py, convert_vae.py, convert_preview.py  -> install/video/
+  h3 h3/common.py, config.py, safetensors.py                   -> install/video/h3/
+
+install/videos.py runs them once per installation, with install/video as the
+working directory and import path, into the prepared-weight cache
+(video/<key>, the key hashing these files and the source commits). The VAE
+converter computes its rotary tables with MLX (H3_MLX_PORT); give it an
+interpreter that has MLX with --converter-python. The runtime the images are
+for is runtime/video (runtime/video/VENDORED); the two are vendored from the
+same commit.

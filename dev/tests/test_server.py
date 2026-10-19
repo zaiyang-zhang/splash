@@ -559,6 +559,8 @@ def main_args(**overrides):
             "port": 0,
             "binary": "splash",
             "kv_format": "int8",
+            "video_root": None,
+            "video_frontend": None,
             **overrides,
         }
     )

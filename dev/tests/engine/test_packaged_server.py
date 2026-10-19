@@ -21,6 +21,8 @@ class PackagedServerTests(unittest.TestCase):
                 ("server", package.SERVER_FILES),
                 ("install", package.INSTALL_FILES),
                 ("install/completions", package.COMPLETION_FILES),
+                ("install/video", package.VIDEO_CONVERTER_FILES),
+                ("install/video/h3", package.VIDEO_CONVERTER_MODULES),
             ):
                 (root / folder).mkdir(parents=True)
                 for name in names:
