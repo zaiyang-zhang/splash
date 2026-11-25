@@ -2139,6 +2139,271 @@ void gatherExtents(MetalBackend &backend) {
           "extent and refused one element short");
 }
 
+// ---------------------------------------------------------------- repro (diagnostic variant, NOT upstream)
+// Inserted before main() of dev/tests/engine/gguf_projection_test.mm by apply_repro.py (block version 3). Runs only when the
+// environment variable GGUFPROJ_REPRO is set; the upstream test is otherwise unchanged.
+#include <map>
+namespace {
+uint32_t envNumber(const char *name, uint32_t otherwise) {
+  const char *v = std::getenv(name);
+  return v && *v ? uint32_t(std::strtoul(v, nullptr, 10)) : otherwise;
+}
+// Rows whose only non-zero inputs are the 32 inputs of one group of K: row r holds ones in group
+// (base + r) % (K / 32). An output of row r and column c is then the sum of column c's 32 weights of that group, so
+// a wrong output names the (column, group) whose weights or partial were wrong.
+std::vector<float> groupProbe(uint32_t rows, uint32_t K, uint32_t base) {
+  std::vector<float> x(uint64_t{rows} * K, 0.f);
+  for (uint32_t r = 0; r < rows; ++r) {
+    const uint32_t g = (base + r) % (K / 32);
+    for (uint32_t k = 0; k < 32; ++k) x[uint64_t{r} * K + g * 32 + k] = 1.f;
+  }
+  return x;
+}
+std::string ranges(const std::set<uint32_t> &values) {
+  std::string s;
+  for (auto it = values.begin(); it != values.end();) {
+    const uint32_t a = *it;
+    uint32_t b = a;
+    ++it;
+    while (it != values.end() && *it == b + 1) b = *it++;
+    if (!s.empty()) s += ',';
+    s += std::to_string(a);
+    if (b != a) s += '-' + std::to_string(b);
+  }
+  return s;
+}
+typedef std::map<uint32_t, std::set<uint32_t>> WrongRows;   // row -> its columns that differ
+WrongRows differing(const std::vector<uint16_t> &got, const std::vector<uint16_t> &truth, uint32_t rows,
+                    uint32_t covered, uint32_t columns) {
+  WrongRows wrong;
+  for (uint32_t r = 0; r < rows; ++r)
+    for (uint32_t c = 0; c < covered; ++c)
+      if (got[uint64_t{r} * columns + c] != truth[uint64_t{r} * columns + c]) wrong[r].insert(c);
+  return wrong;
+}
+// probe: rows are groups (base + r) % groups. With `table` (the one-lane outputs of every group's probe row,
+// [groups][columns]) each wrong row is classified: every wrong value zero; or equal to the table's values of another
+// group g' at a column offset d that is a multiple of 32 (what a stage slot left from another step or tile would
+// give); or neither, with the first value shown.
+std::string describe(const WrongRows &wrong, bool probe, uint32_t base, uint32_t groups,
+                     const std::vector<uint16_t> *got = nullptr, const std::vector<uint16_t> *table = nullptr,
+                     uint32_t columns = 0, uint32_t covered = 0,
+                     const std::function<float(uint32_t, uint32_t)> &zeroCodes = nullptr) {
+  uint64_t count = 0;
+  std::set<uint32_t> allColumns, allRows;
+  for (const auto &[r, cols] : wrong) {
+    count += cols.size();
+    allRows.insert(r);
+    allColumns.insert(cols.begin(), cols.end());
+  }
+  std::string s = "wrong=" + std::to_string(count) + " rows=" + std::to_string(wrong.size()) + " [" + ranges(allRows) +
+                  "] columns=" + std::to_string(allColumns.size()) + " [" + ranges(allColumns) + "]";
+  if (!probe) return s;
+  s += " by group:";
+  int shown = 0;
+  for (const auto &[r, cols] : wrong) {
+    if (shown++ == 8) { s += " ..."; break; }
+    const uint32_t g = (base + r) % groups;
+    s += " g" + std::to_string(g) + "{" + ranges(cols) + "}";
+    if (!got || !table) continue;
+    bool zero = true;
+    for (const uint32_t c : cols) zero = zero && ((*got)[uint64_t{r} * columns + c] & 0x7FFF) == 0;
+    if (zero) { s += "=zero"; continue; }
+    // Step of the group in its K partition is printed by the caller's label (S); here: do the wrong values equal
+    // the sum the group gives when its 32 codes all read as zero (zeroCodes(group, column), within 1%)?
+    if (zeroCodes) {
+      uint32_t equal = 0;
+      for (const uint32_t c : cols) {
+        const float v = bf16ToFloat((*got)[uint64_t{r} * columns + c]), z = zeroCodes(g, c);
+        equal += std::fabs(v - z) <= 0.01f * std::fabs(z);
+      }
+      s += "=codes0(" + std::to_string(equal) + "/" + std::to_string(cols.size()) + ")";
+      if (equal == cols.size()) continue;
+    }
+    uint32_t best = 0, bestGroup = 0;
+    int bestOffset = 0;
+    for (uint32_t other = 0; other < groups; ++other)
+      for (int d = -int(covered) + 32; d < int(covered); d += 32) {
+        uint32_t matches = 0;
+        for (const uint32_t c : cols) {
+          const int at = int(c) + d;
+          if (at < 0 || at >= int(covered)) continue;
+          matches += (*got)[uint64_t{r} * columns + c] == (*table)[uint64_t{other} * columns + uint32_t(at)];
+        }
+        if (matches > best) { best = matches; bestGroup = other; bestOffset = d; }
+      }
+    const uint32_t first = *cols.begin();
+    s += "=g" + std::to_string(bestGroup) + (bestOffset < 0 ? "" : "+") + std::to_string(bestOffset) + "(" +
+         std::to_string(best) + "/" + std::to_string(cols.size()) + ") got " +
+         digits(bf16ToFloat((*got)[uint64_t{r} * columns + first])) + " want " +
+         digits(bf16ToFloat((*table)[uint64_t{g} * columns + first]));
+  }
+  return s;
+}
+// The one-lane outputs of every group's probe row: [groups][columns], from `runLane(input rows of 8)`.
+template <class RunLane>
+std::vector<uint16_t> probeTable(uint32_t K, uint32_t columns, RunLane runLane) {
+  const uint32_t groups = K / 32;
+  std::vector<uint16_t> table(uint64_t{groups} * columns);
+  for (uint32_t base = 0; base < groups; base += kLaneRows) {
+    const std::vector<uint16_t> out = runLane(groupProbe(kLaneRows, K, base));
+    std::copy(out.begin(), out.begin() + uint64_t{kLaneRows} * columns, table.begin() + uint64_t{base} * columns);
+  }
+  return table;
+}
+std::string joined(const std::vector<std::string> &names) {
+  std::set<std::string> unique(names.begin(), names.end());
+  std::string s;
+  for (const std::string &n : unique) s += (s.empty() ? "" : " ") + n;
+  return s;
+}
+const uint32_t kDense = 0xFFFFFFFFu;   // `base` of the dense input
+
+// Plain staged decode of one tensor [512, 2048], lockstep walk: the plan of `lanes` lanes run `repeats` times and
+// compared bit for bit with its lanes' one-lane projections (the 8-row tile, same splits), which the upstream test
+// requires to be equal.
+void reproDecode(MetalBackend &backend, const Linear &linear) {
+  constexpr uint32_t N = 512, columns = N + kPadding, K = 2048, groups = K / 32;
+  const uint32_t repeats = envNumber("GGUFPROJ_REPEATS", 50), onlySplits = envNumber("GGUFPROJ_SPLITS", 0),
+                 onlyLanes = envNumber("GGUFPROJ_LANES", 0), shown = envNumber("GGUFPROJ_SHOWN", 3);
+  std::vector<Fmt> formats{IQ4NL, IQ4XS, Q40, MXFP4, Q80};
+  if (envNumber("GGUFPROJ_IQ4NL_ONLY", 0)) formats = {IQ4NL};
+  for (const Fmt f : formats) {
+    const Tensor w = tensor(backend, f, N, K);
+    const Projection up = projection({&w}, columns);
+    for (const uint32_t splits : {8u, 16u}) {
+      if (onlySplits && splits != onlySplits) continue;
+      const LinearPlan tablePlan = Linear::plan(decode({columns, K}, 1, LinearEpilogue::None),
+                                                config(LinearTile::GgufStaged, splits), FloatOutput::BFloat16);
+      const std::vector<uint16_t> table = probeTable(K, columns, [&](const std::vector<float> &rows8) {
+        return run(backend, linear, tablePlan, up, nullptr, storageRows(rows8, K, kLaneRows, kLaneRows), {}, kPoisonNaN,
+                   N, "repro table").output;
+      });
+      // IQ4_NL: a group whose 32 codes read as zero sums to 32 * half(kIQ4NLValues[0] * d), d the block's scale
+      // (native block: half d, then 16 code bytes; row n of the tensor is destination column n).
+      const std::function<float(uint32_t, uint32_t)> zeroCodes =
+          f == IQ4NL ? std::function<float(uint32_t, uint32_t)>([&](uint32_t g, uint32_t c) {
+            uint16_t d;
+            std::memcpy(&d, w.native.data() + (uint64_t{c} * groups + g) * kQuantFormats[f].block_bytes, 2);
+            return 32.f * h2f(f2h(float(kIQ4NLValues[0]) * h2f(d)));
+          }) : std::function<float(uint32_t, uint32_t)>();
+      for (const uint32_t lanes : {1u, 2u, 3u, 4u, 6u, 8u}) {
+        if (onlyLanes && lanes != onlyLanes) continue;
+        const uint32_t rows = lanes * kLaneRows;
+        std::vector<uint32_t> bases{kDense};
+        for (uint32_t base = 0; base < groups; base += rows) bases.push_back(base);
+        for (const uint32_t base : bases) {
+          const bool probe = base != kDense;
+          const std::vector<float> x = probe ? groupProbe(rows, K, base) : activations(Inputs::Dense, rows, K);
+          const LinearPlan one = Linear::plan(decode({columns, K}, 1, LinearEpilogue::None),
+                                              config(LinearTile::GgufStaged, splits), FloatOutput::BFloat16);
+          std::vector<uint16_t> truth(uint64_t{rows} * columns, kUnwritten);
+          bool truthStable = true;
+          for (uint32_t lane = 0; lane < lanes; ++lane) {
+            const std::vector<float> laneRows(x.begin() + uint64_t{lane} * kLaneRows * K,
+                                              x.begin() + uint64_t{lane + 1} * kLaneRows * K);
+            const std::vector<uint16_t> in = storageRows(laneRows, K, kLaneRows, kLaneRows);
+            const Outcome a = run(backend, linear, one, up, nullptr, in, {}, kPoisonNaN, N, "repro truth");
+            const Outcome b = run(backend, linear, one, up, nullptr, in, {}, kPoisonNaN, N, "repro truth");
+            truthStable = truthStable && a.output == b.output;
+            std::copy(a.output.begin(), a.output.begin() + uint64_t{kLaneRows} * columns,
+                      truth.begin() + uint64_t{lane} * kLaneRows * columns);
+          }
+          const LinearPlan plan = Linear::plan(decode({columns, K}, lanes, LinearEpilogue::None),
+                                               config(LinearTile::GgufStaged, splits), FloatOutput::BFloat16);
+          const std::vector<uint16_t> in = storageRows(x, K, rows, plan.storageRows());
+          uint32_t failed = 0;
+          std::string details, pipelines;
+          for (uint32_t rep = 0; rep < repeats; ++rep) {
+            const Outcome out = run(backend, linear, plan, up, nullptr, in, {}, kPoisonFinite, N, "repro decode");
+            if (pipelines.empty()) pipelines = joined(out.pipelines);
+            const WrongRows wrong = differing(out.output, truth, rows, N, columns);
+            if (wrong.empty()) continue;
+            if (failed++ < shown)
+              details += "    rep " + std::to_string(rep) + ": " +
+                         describe(wrong, probe, base, groups, &out.output, &table, columns, N, zeroCodes) + "\n";
+          }
+          std::cout << "repro decode " << fmtName(f) << " S=" << splits << " L=" << lanes << " tile=" << plan.storageRows()
+                    << (probe ? " probe base=" + std::to_string(base) : std::string(" dense")) << ": " << failed << "/"
+                    << repeats << " runs differ from the one-lane projections; truth "
+                    << (truthStable ? "stable" : "UNSTABLE") << "; " << pipelines << '\n'
+                    << details;
+        }
+      }
+    }
+  }
+}
+
+// Gate/up of two tensors of one format [768, 2048] as the upstream oneGateUpPass section runs it: the two-pass plan
+// and the one-pass plan of `lanes` lanes, each run `repeats` times and compared bit for bit with the lanes' one-lane
+// two-pass projections.
+void reproOnePass(MetalBackend &backend, const Linear &linear) {
+  constexpr uint32_t N = 768, columns = N + kPadding, K = 2048, groups = K / 32;
+  const uint32_t repeats = envNumber("GGUFPROJ_REPEATS", 50), onlySplits = envNumber("GGUFPROJ_SPLITS", 0),
+                 shown = envNumber("GGUFPROJ_SHOWN", 3);
+  std::vector<Fmt> formats{IQ4NL, Q40};
+  if (envNumber("GGUFPROJ_IQ4NL_ONLY", 0)) formats = {IQ4NL};
+  for (const Fmt f : formats) {
+    const Tensor g = tensor(backend, f, N, K), u = tensor(backend, f, N, K);
+    const Projection gate = projection({&g}, columns), up = projection({&u}, columns);
+    for (const uint32_t splits : {8u, 16u}) {
+      if (onlySplits && splits != onlySplits) continue;
+      const LinearPlan tablePlan = Linear::plan(decode({columns, K}, 1, LinearEpilogue::GateUp),
+                                                config(LinearTile::GgufStaged, splits), FloatOutput::BFloat16);
+      const std::vector<uint16_t> table = probeTable(K, columns, [&](const std::vector<float> &rows8) {
+        return run(backend, linear, tablePlan, up, &gate, storageRows(rows8, K, kLaneRows, tablePlan.storageRows()), {},
+                   kPoisonNaN, N, "repro table").output;
+      });
+      for (const uint32_t lanes : {1u, 2u, 3u, 4u})
+        for (const uint32_t base : {kDense, 0u, 32u}) {
+          const bool probe = base != kDense;
+          const uint32_t rows = lanes * kLaneRows;
+          const std::vector<float> x = probe ? groupProbe(rows, K, base) : activations(Inputs::Dense, rows, K);
+          LinearConfig c = config(LinearTile::GgufStaged, splits);
+          const LinearPlan oneLane = Linear::plan(decode({columns, K}, 1, LinearEpilogue::GateUp), c, FloatOutput::BFloat16);
+          std::vector<uint16_t> truth(uint64_t{rows} * columns, kUnwritten);
+          bool truthStable = true;
+          for (uint32_t lane = 0; lane < lanes; ++lane) {
+            const std::vector<float> laneRows(x.begin() + uint64_t{lane} * kLaneRows * K,
+                                              x.begin() + uint64_t{lane + 1} * kLaneRows * K);
+            const std::vector<uint16_t> in = storageRows(laneRows, K, kLaneRows, oneLane.storageRows());
+            const Outcome a = run(backend, linear, oneLane, up, &gate, in, {}, kPoisonNaN, N, "repro truth");
+            const Outcome b = run(backend, linear, oneLane, up, &gate, in, {}, kPoisonNaN, N, "repro truth");
+            truthStable = truthStable && a.output == b.output;
+            std::copy(a.output.begin(), a.output.begin() + uint64_t{kLaneRows} * columns,
+                      truth.begin() + uint64_t{lane} * kLaneRows * columns);
+          }
+          const LinearWorkload wl = decode({columns, K}, lanes, LinearEpilogue::GateUp);
+          const LinearPlan twoPasses = Linear::plan(wl, c, FloatOutput::BFloat16);
+          c.oneGateUpPass = true;
+          const LinearPlan onePass = Linear::plan(wl, c, FloatOutput::BFloat16);
+          const std::vector<uint16_t> in = storageRows(x, K, rows, onePass.storageRows());
+          for (const LinearPlan *plan : {&twoPasses, &onePass}) {
+            uint32_t failed = 0;
+            std::string details, pipelines;
+            for (uint32_t rep = 0; rep < repeats; ++rep) {
+              const Outcome out = run(backend, linear, *plan, up, &gate, in, {},
+                                      plan == &twoPasses ? kPoisonNaN : kPoisonFinite, N, "repro gate/up");
+              if (pipelines.empty()) pipelines = joined(out.pipelines);
+              const WrongRows wrong = differing(out.output, truth, rows, N, columns);
+              if (wrong.empty()) continue;
+              if (failed++ < shown)
+                details += "    rep " + std::to_string(rep) + ": " +
+                           describe(wrong, probe, base, groups, &out.output, &table, columns, N) + "\n";
+            }
+            std::cout << "repro gate/up " << fmtName(f) << " S=" << splits << " L=" << lanes << " tile="
+                      << plan->storageRows() << (plan == &twoPasses ? " two passes" : " one pass")
+                      << (probe ? " probe base=" + std::to_string(base) : std::string(" dense")) << ": " << failed
+                      << "/" << repeats << " runs differ from the one-lane two-pass projections; truth "
+                      << (truthStable ? "stable" : "UNSTABLE") << "; " << pipelines << '\n'
+                      << details;
+          }
+        }
+    }
+  }
+}
+}   // namespace
+
 int main(int argc, char **argv) {
   @autoreleasepool {
     if (argc != 2) {
@@ -2148,6 +2413,12 @@ int main(int argc, char **argv) {
     try {
       MetalBackend backend(argv[1]);
       const Linear linear(backend.capabilities(), Int8Activations::On, StepKind::Prefill);
+      if (std::getenv("GGUFPROJ_REPRO")) {   // diagnostic variant, not upstream
+        if (!envNumber("GGUFPROJ_SKIP_DECODE", 0)) reproDecode(backend, linear);
+        if (!envNumber("GGUFPROJ_SKIP_ONEPASS", 0)) reproOnePass(backend, linear);
+        std::cout << "repro: done, " << failures << " fail() calls\n";
+        return 0;
+      }
       for (const LinearTile tile : {LinearTile::GgufRegister, LinearTile::GgufStaged}) {
         decodeTile(backend, linear, tile, false, decodeInputs(false), tileFormats(tile));
         fusedDecode(backend, linear, tile, false);
